@@ -23,6 +23,14 @@
         #terminal {
             width: 100%;
             height: 100%;
+            padding: 2px;
+        }
+        /* Prevent xterm from overflowing */
+        .xterm-viewport {
+            overflow-y: auto !important;
+        }
+        .xterm-screen {
+            max-width: 100%;
         }
     </style>
 </head>
@@ -60,17 +68,28 @@
         // Mount terminal to DOM
         term.open(document.getElementById('terminal'));
 
+        // Get actual cell dimensions by measuring
+        const getCellDimensions = () => {
+            // Estimate based on font size (14px)
+            // Most monospace fonts at 14px are approximately 8.4x18 pixels
+            return { width: 8.4, height: 18 };
+        };
+
         // Resize terminal to fit container
         const fitTerminal = () => {
             const container = document.getElementById('terminal');
             const width = container.clientWidth;
             const height = container.clientHeight;
 
-            // Calculate cols and rows based on font size
-            const fontSize = 14;
-            const cols = Math.floor(width / fontSize * 2);
-            const rows = Math.floor(height / fontSize * 1.7);
+            // Get actual character dimensions
+            const cell = getCellDimensions();
 
+            // Calculate cols and rows with margin to prevent overflow
+            // Use 8px margin for padding and borders
+            const cols = Math.max(1, Math.floor((width - 8) / cell.width));
+            const rows = Math.max(1, Math.floor((height - 8) / cell.height));
+
+            console.log(`Terminal size: ${cols}x${rows}, container: ${width}x${height}`);
             term.resize(cols, rows);
         };
 
