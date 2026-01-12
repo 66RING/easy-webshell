@@ -60,6 +60,34 @@
         // Mount terminal to DOM
         term.open(document.getElementById('terminal'));
 
+        // Resize terminal to fit container
+        const fitTerminal = () => {
+            const container = document.getElementById('terminal');
+            const width = container.clientWidth;
+            const height = container.clientHeight;
+
+            // Calculate cols and rows based on font size
+            const fontSize = 14;
+            const cols = Math.floor(width / fontSize * 2);
+            const rows = Math.floor(height / fontSize * 1.7);
+
+            term.resize(cols, rows);
+        };
+
+        // Initial fit and resize on window change
+        fitTerminal();
+        window.addEventListener('resize', () => {
+            fitTerminal();
+            // Notify server of new size if connected
+            if (wsConnected) {
+                const resize = {
+                    cols: term.cols,
+                    rows: term.rows
+                };
+                ws.send(JSON.stringify(resize));
+            }
+        });
+
         // Track WebSocket connection state
         let wsConnected = false;
         let pendingInput = [];
@@ -71,6 +99,9 @@
         ws.onopen = () => {
             console.log('WebSocket connected');
             wsConnected = true;
+
+            // Fit terminal to window size
+            fitTerminal();
 
             // Send terminal size
             const resize = {
@@ -108,17 +139,6 @@
             } else {
                 // Buffer input until WebSocket is connected
                 pendingInput.push(data);
-            }
-        });
-
-        // Handle terminal resize
-        term.onResize(size => {
-            if (wsConnected) {
-                const resize = {
-                    cols: size.cols,
-                    rows: size.rows
-                };
-                ws.send(JSON.stringify(resize));
             }
         });
     </script>
