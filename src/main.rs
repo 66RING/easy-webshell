@@ -141,131 +141,12 @@ impl Drop for PtySession {
 }
 
 /// HTML content for the terminal interface
-fn get_html_content() -> &'static str {
-    r#"
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>TTYD - Simple Terminal</title>
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
-    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        body {
-            height: 100vh;
-            background: #1e1e1e;
-        }
-        #terminal {
-            width: 100%;
-            height: 100%;
-        }
-    </style>
-</head>
-<body>
-    <div id="terminal"></div>
-    <script>
-        // Create xterm.js instance
-        const term = new Terminal({
-            cursorBlink: true,
-            fontSize: 14,
-            fontFamily: 'Consolas, "Courier New", monospace',
-            theme: {
-                background: '#1e1e1e',
-                foreground: '#ffffff',
-                cursor: '#ffffff',
-                black: '#000000',
-                red: '#cd3131',
-                green: '#0dbc79',
-                yellow: '#e5e510',
-                blue: '#2472c8',
-                magenta: '#bc3fbc',
-                cyan: '#11a8cd',
-                white: '#e5e5e5',
-                brightBlack: '#666666',
-                brightRed: '#f14c4c',
-                brightGreen: '#23d18b',
-                brightYellow: '#f5f543',
-                brightBlue: '#3b8eea',
-                brightMagenta: '#d670d6',
-                brightCyan: '#29b8db',
-                brightWhite: '#ffffff'
-            }
-        });
-
-        // Mount terminal to DOM
-        term.open(document.getElementById('terminal'));
-
-        // Track WebSocket connection state
-        let wsConnected = false;
-        let pendingInput = [];
-
-        // Connect to WebSocket server
-        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
-
-        ws.onopen = () => {
-            console.log('WebSocket connected');
-            wsConnected = true;
-
-            // Send terminal size
-            const resize = {
-                cols: term.cols,
-                rows: term.rows
-            };
-            ws.send(JSON.stringify(resize));
-
-            // Send any pending input
-            while (pendingInput.length > 0) {
-                const data = pendingInput.shift();
-                ws.send(data);
-            }
-        };
-
-        ws.onmessage = (event) => {
-            // Write data from PTY to terminal
-            term.write(event.data);
-        };
-
-        ws.onclose = () => {
-            console.log('WebSocket disconnected');
-            wsConnected = false;
-            term.write('\r\n\x1b[31mConnection closed\x1b[0m');
-        };
-
-        ws.onerror = (error) => {
-            console.error('WebSocket error:', error);
-        };
-
-        // Send user input to PTY
-        term.onData(data => {
-            if (wsConnected) {
-                ws.send(data);
-            } else {
-                // Buffer input until WebSocket is connected
-                pendingInput.push(data);
-            }
-        });
-
-        // Handle terminal resize
-        term.onResize(size => {
-            if (wsConnected) {
-                const resize = {
-                    cols: size.cols,
-                    rows: size.rows
-                };
-                ws.send(JSON.stringify(resize));
-            }
-        });
-    </script>
-</body>
-</html>
-    "#
+fn get_html_content() -> String {
+    std::fs::read_to_string("index.html")
+        .unwrap_or_else(|e| {
+            error!("Failed to read index.html: {}", e);
+            "<html><body><h1>Error loading page</h1></body></html>".to_string()
+        })
 }
 
 /// Handle WebSocket connection
@@ -417,7 +298,7 @@ async fn handle_http_connection(
         let (status, content_type, body) = if path == "/" || path == "/index.html" {
             ("200 OK", "text/html", get_html_content())
         } else {
-            ("404 Not Found", "text/plain", "Not Found")
+            ("404 Not Found", "text/plain", "Not Found".to_string())
         };
 
         let response = format!(
