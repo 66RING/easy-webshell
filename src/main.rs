@@ -4,7 +4,7 @@ use log::{debug, error, info};
 use pty::fork::{Fork, Master};
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
@@ -15,6 +15,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::WebSocketStream;
+
+const MAX_UPLOAD_SIZE: usize = 100 * 1024 * 1024; // 100MB max file size
 
 /// Terminal window size structure
 #[repr(C)]
@@ -320,7 +322,7 @@ fn parse_multipart_upload(
             None => break,
         };
 
-        // Parse headers to find filename
+        // Parse headers to find filename (only headers are text, data is binary)
         let headers_section =
             String::from_utf8_lossy(&body[boundary_pos + boundary_bytes.len() + 2..headers_end]);
         let data_start = headers_end + 4;
@@ -331,6 +333,8 @@ fn parse_multipart_upload(
                 let start = line.find("filename=\"").unwrap() + 10;
                 let end = line[start..].find('"').unwrap();
                 filename = line[start..start + end].to_string();
+                // Normalize path separators to forward slash
+                filename = filename.replace('\\', "/");
                 break;
             }
         }
@@ -346,6 +350,7 @@ fn parse_multipart_upload(
         };
 
         if !filename.is_empty() {
+            // Copy raw bytes for binary data
             file_data = body[data_start..data_end].to_vec();
             break;
         }
@@ -375,7 +380,14 @@ async fn handle_file_upload(
 
     let file_path = current_dir.join(&filename);
 
-    // Write file to disk
+    // Create parent directories if they don't exist
+    if let Some(parent) = file_path.parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+
+    // Write file to disk (binary mode)
     let mut file = File::create(&file_path)?;
     file.write_all(&file_data)?;
     file.flush()?;
@@ -394,17 +406,34 @@ async fn handle_http_connection(
     mut stream: TcpStream,
     current_dir: std::path::PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Read the HTTP request
-    let mut request_buffer = vec![0u8; 65536];
-    let n = stream.read(&mut request_buffer).await?;
+    // Read HTTP headers first
+    let mut header_buffer = vec![0u8; 8192];
+    let total_read;
+    let header_end;
 
-    if n == 0 {
-        return Ok(());
+    // Read until we find the end of headers (\r\n\r\n)
+    let mut bytes_read = 0;
+    loop {
+        let n = stream.read(&mut header_buffer[bytes_read..]).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        bytes_read += n;
+
+        // Look for end of headers marker
+        if let Some(pos) = header_buffer[..bytes_read].windows(4).position(|w| w == b"\r\n\r\n") {
+            total_read = bytes_read;
+            header_end = pos + 4;
+            break;
+        }
+
+        if bytes_read >= header_buffer.len() {
+            return Err("Headers too large".into());
+        }
     }
-    request_buffer.truncate(n);
 
-    let request = String::from_utf8_lossy(&request_buffer).to_string();
-    let request_lines: Vec<&str> = request.lines().collect();
+    let header_data = String::from_utf8_lossy(&header_buffer[..header_end]);
+    let request_lines: Vec<&str> = header_data.lines().collect();
 
     if request_lines.is_empty() {
         return Ok(());
@@ -413,12 +442,47 @@ async fn handle_http_connection(
     let first_line = request_lines[0];
     let parts: Vec<&str> = first_line.split_whitespace().collect();
 
-    if parts.len() >= 2 {
-        let method = parts[0];
-        let path = parts[1];
+    if parts.len() < 2 {
+        return Ok(());
+    }
 
-        let (status, content_type, body) = if method == "POST" && path == "/upload" {
-            // Handle file upload
+    let method = parts[0];
+    let path = parts[1];
+
+    let (status, content_type, body) = if method == "POST" && path == "/upload" {
+        // Extract Content-Length
+        let content_length = request_lines
+            .iter()
+            .find(|line| line.to_lowercase().starts_with("content-length:"))
+            .and_then(|line| line.split(':').nth(1))
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+
+        if content_length > MAX_UPLOAD_SIZE {
+            (
+                "413 Payload Too Large",
+                "text/plain",
+                format!("File too large. Maximum size: {} MB", MAX_UPLOAD_SIZE / 1024 / 1024),
+            )
+        } else {
+            // Calculate body size already read
+            let body_already_read = total_read - header_end;
+
+            // Allocate buffer for entire request
+            let mut request_buffer = vec![0u8; header_end + content_length];
+            request_buffer[..header_end].copy_from_slice(&header_buffer[..header_end]);
+
+            // Copy body data already read
+            request_buffer[header_end..header_end + body_already_read]
+                .copy_from_slice(&header_buffer[header_end..total_read]);
+
+            // Read remaining body data
+            if body_already_read < content_length {
+                stream
+                    .read_exact(&mut request_buffer[header_end + body_already_read..])
+                    .await?;
+            }
+
             let content_type_header = request_lines
                 .iter()
                 .find(|line| line.to_lowercase().starts_with("content-type:"))
@@ -430,23 +494,23 @@ async fn handle_http_connection(
                 Ok(msg) => ("200 OK", "text/plain", msg),
                 Err(e) => ("400 Bad Request", "text/plain", format!("Upload failed: {}", e)),
             }
-        } else if path == "/" || path == "/index.html" {
-            ("200 OK", "text/html", get_html_content())
-        } else {
-            ("404 Not Found", "text/plain", "Not Found".to_string())
-        };
+        }
+    } else if path == "/" || path == "/index.html" {
+        ("200 OK", "text/html", get_html_content())
+    } else {
+        ("404 Not Found", "text/plain", "Not Found".to_string())
+    };
 
-        let response = format!(
-            "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
-            status,
-            content_type,
-            body.len(),
-            body
-        );
+    let response = format!(
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
+        status,
+        content_type,
+        body.len(),
+        body
+    );
 
-        stream.write_all(response.as_bytes()).await?;
-        stream.flush().await?;
-    }
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await?;
 
     Ok(())
 }
