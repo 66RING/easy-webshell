@@ -4,10 +4,12 @@ use log::{debug, error, info};
 use pty::fork::{Fork, Master};
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::ffi::CStr;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -15,6 +17,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::WebSocketStream;
+use tokio::time::{interval, Duration};
 
 const MAX_UPLOAD_SIZE: usize = 100 * 1024 * 1024; // 100MB max file size
 
@@ -38,6 +41,7 @@ struct ResizeMessage {
 struct PtySession {
     _fork: Fork,
     master: Option<Master>,
+    pts_name: Option<String>,
 }
 
 impl PtySession {
@@ -65,9 +69,19 @@ impl PtySession {
             // Parent process
             let master = fork.is_parent()?;
 
+            // Get the PTS slave name
+            let pts_name = unsafe {
+                master
+                    .ptsname()
+                    .ok()
+                    .and_then(|s| CStr::from_ptr(s).to_str().ok())
+                    .map(|s| s.to_string())
+            };
+
             let mut session = PtySession {
                 _fork: fork,
                 master: Some(master.clone()),
+                pts_name,
             };
 
             // Set master to non-blocking mode
@@ -155,17 +169,18 @@ fn get_html_content() -> String {
 /// Handle WebSocket connection
 async fn handle_websocket_connection(
     ws_stream: WebSocketStream<TcpStream>,
-    _current_dir: Arc<Mutex<std::path::PathBuf>>,
+    current_dir: Arc<Mutex<PathBuf>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("New WebSocket connection established");
 
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     let pty_session = Arc::new(Mutex::new(PtySession::new()?));
     let pty_session_clone = pty_session.clone();
+    let current_dir_clone = current_dir.clone();
 
     // Task 1: Forward PTY output to WebSocket
     let pty_to_ws_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(10));
+        let mut interval = interval(Duration::from_millis(10));
         loop {
             interval.tick().await;
 
@@ -184,7 +199,11 @@ async fn handle_websocket_connection(
     });
 
     // Task 2: Forward WebSocket input to PTY
+    let pty_session_for_sync = pty_session_clone.clone();
+    let pty_session_for_sync2 = pty_session_clone.clone();
+    let current_dir_for_ws = current_dir.clone();
     let ws_to_pty_task = tokio::spawn(async move {
+        let mut last_cmd = String::new();
         while let Some(result) = ws_receiver.next().await {
             match result {
                 Ok(Message::Text(text)) => {
@@ -205,6 +224,29 @@ async fn handle_websocket_connection(
                         debug!("WS -> PTY: {} bytes", text.len());
                         let mut session = pty_session_clone.lock().await;
                         session.write(text.as_bytes());
+
+                        // Track commands to detect cd
+                        if text == "\r" || text == "\n" {
+                            // Check if last command was 'cd'
+                            let cmd = last_cmd.trim().to_string();
+                            if cmd.starts_with("cd ") || cmd == "cd" {
+                                // Sync current directory after cd command
+                                let pty = pty_session_for_sync.clone();
+                                let dir = current_dir_for_ws.clone();
+                                tokio::spawn(async move {
+                                    // Wait a bit for cd to complete
+                                    tokio::time::sleep(Duration::from_millis(100)).await;
+                                    sync_current_directory(pty, dir).await;
+                                });
+                            }
+                            last_cmd.clear();
+                        } else if text == "\u{7f}" || text == "\x08" {
+                            // Backspace
+                            last_cmd.pop();
+                        } else if text.len() == 1 && text.chars().next().map(|c| c.is_ascii_graphic()).unwrap_or(false) {
+                            // Regular character
+                            last_cmd.push(text.chars().next().unwrap());
+                        }
                     }
                 }
                 Ok(Message::Binary(data)) => {
@@ -225,6 +267,17 @@ async fn handle_websocket_connection(
         }
     });
 
+    // Task 3: Periodically sync current directory
+    let dir_sync_task = tokio::spawn(async move {
+        let mut sync_interval = interval(Duration::from_secs(2));
+        // Initial sync
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        loop {
+            sync_interval.tick().await;
+            sync_current_directory(pty_session_for_sync2.clone(), current_dir_clone.clone()).await;
+        }
+    });
+
     // Wait for either task to complete
     tokio::select! {
         _ = pty_to_ws_task => {
@@ -233,10 +286,86 @@ async fn handle_websocket_connection(
         _ = ws_to_pty_task => {
             debug!("WS to PTY task completed");
         }
+        _ = dir_sync_task => {
+            debug!("Directory sync task completed");
+        }
     }
 
     info!("WebSocket connection closed");
     Ok(())
+}
+
+/// Sync current working directory from PTY
+async fn sync_current_directory(
+    pty_session: Arc<Mutex<PtySession>>,
+    current_dir: Arc<Mutex<PathBuf>>,
+) {
+    // Get the PTS name from the session
+    let pts_name = {
+        let session = pty_session.lock().await;
+        session.pts_name.clone()
+    };
+
+    if let Some(pts) = pts_name {
+        // Find the process that has this PTY as its controlling terminal
+        // by looking at /proc/[pid]/fd/0 (stdin) or /proc/[pid]/fd/1 (stdout)
+        let cwd = find_shell_cwd(&pts);
+
+        // Handle the result before any await
+        let cwd_opt = cwd.ok();
+
+        if let Some(cwd) = cwd_opt {
+            let mut dir = current_dir.lock().await;
+            let old_dir = dir.clone();
+            *dir = cwd.clone();
+            if old_dir != *dir {
+                info!("Current directory updated: {} -> {}", old_dir.display(), dir.display());
+            }
+        }
+    }
+}
+
+/// Find the shell's current working directory by PTY device
+fn find_shell_cwd(pts_name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let proc_path = PathBuf::from("/proc");
+
+    // Iterate through all process directories in /proc
+    for entry in fs::read_dir(&proc_path)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+    {
+        let pid_str = entry.file_name();
+        // Skip if not a numeric PID
+        if pid_str.to_string_lossy().chars().all(|c| c.is_ascii_digit()) {
+            let pid: u32 = pid_str.to_string_lossy().parse().unwrap_or(0);
+            if pid == 0 || pid == std::process::id() {
+                continue;
+            }
+
+            // Check if this process has the PTY as its stdin/stdout/stderr
+            let fds_path = entry.path().join("fd");
+            if let Ok(fds) = fs::read_dir(&fds_path) {
+                for fd_entry in fds.filter_map(|e| e.ok()) {
+                    if let Ok(target) = fs::read_link(&fd_entry.path()) {
+                        let target_str = target.to_string_lossy();
+                        // Check if this fd points to our PTY
+                        if target_str.contains(pts_name) || target_str == pts_name {
+                            // Found the process! Now get its cwd
+                            let cwd_path = entry.path().join("cwd");
+                            if let Ok(cwd) = fs::read_link(&cwd_path) {
+                                debug!("Found shell PID {} with cwd: {}", pid, cwd.display());
+                                return Ok(cwd);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: return current directory
+    debug!("Could not find shell process, using current directory");
+    Ok(env::current_dir()?)
 }
 
 /// Handle client connection
