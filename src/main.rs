@@ -97,6 +97,12 @@ pub struct Config {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    #[serde(default = "default_cur_dir")]
+    pub cur_dir: Option<String>,
+}
+
+fn default_cur_dir() -> Option<String> {
+    None
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -113,6 +119,7 @@ impl Default for Config {
             server: ServerConfig {
                 host: "0.0.0.0".to_string(),
                 port: 7681,  // Changed from 8080 to match config.toml.example
+                cur_dir: None,
             },
             auth: AuthConfig {
                 enabled: false,
@@ -144,6 +151,9 @@ fn load_config() -> Config {
                             if config.auth.enabled { "enabled" } else { "disabled" },
                             config.auth.method
                         );
+                        if let Some(ref dir) = config.server.cur_dir {
+                            info!("Working directory: {}", dir);
+                        }
                         return config;
                     }
                     Err(e) => {
@@ -245,19 +255,21 @@ struct PtySession {
 }
 
 impl PtySession {
-    /// Create a new PTY session with default size
-    fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        Self::with_size(80, 24)
-    }
-
-    /// Create a new PTY session with specified size
-    fn with_size(cols: u16, rows: u16) -> Result<Self, Box<dyn std::error::Error>> {
+    /// Create a new PTY session with specified size and initial directory
+    fn with_size_and_dir(cols: u16, rows: u16, initial_dir: Option<&PathBuf>) -> Result<Self, Box<dyn std::error::Error>> {
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
 
         let fork = Fork::from_ptmx()?;
 
         if let Ok(_child) = fork.is_child() {
-            // Child process - spawn shell
+            // Child process - set working directory if specified
+            if let Some(dir) = initial_dir {
+                if let Err(e) = env::set_current_dir(dir) {
+                    eprintln!("Failed to set working directory {}: {}", dir.display(), e);
+                }
+            }
+
+            // Spawn shell
             let _ = Command::new(&shell).exec();
             // If exec returns, there was an error
             Err(std::io::Error::new(
@@ -377,7 +389,14 @@ async fn handle_websocket_connection(
     use tokio::sync::mpsc;
 
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
-    let pty_session = Arc::new(Mutex::new(PtySession::new()?));
+
+    // Get initial directory for PTY session
+    let initial_dir = {
+        let dir = current_dir.lock().await;
+        Some(dir.clone())
+    };
+
+    let pty_session = Arc::new(Mutex::new(PtySession::with_size_and_dir(80, 24, initial_dir.as_ref())?));
     let pty_session_clone = pty_session.clone();
     let current_dir_clone = current_dir.clone();
 
@@ -1211,7 +1230,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind((host, port)).await?;
 
     // Shared current working directory state
-    let current_dir = Arc::new(Mutex::new(env::current_dir()?));
+    let initial_dir = if let Some(ref custom_dir) = config.server.cur_dir {
+        // Use custom directory from config
+        PathBuf::from(custom_dir)
+    } else {
+        // Use current working directory
+        env::current_dir()?
+    };
+
+    // Validate and create the directory if it doesn't exist
+    if !initial_dir.exists() {
+        info!("Creating working directory: {}", initial_dir.display());
+        fs::create_dir_all(&initial_dir)?;
+    }
+
+    info!("Working directory: {}", initial_dir.display());
+
+    let current_dir = Arc::new(Mutex::new(initial_dir));
 
     // Wrap authenticator in Arc for sharing across connections
     let authenticator = Arc::new(authenticator);

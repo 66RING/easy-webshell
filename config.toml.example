@@ -6,6 +6,10 @@
 host = "0.0.0.0"
 port = 7681
 
+# Working directory (optional)
+# If not specified, uses the current directory when the server starts
+# cur_dir = "/path/to/your/directory"
+
 [auth]
 # Enable/disable authentication
 enabled = true
