@@ -24,6 +24,186 @@ use zip::write::FileOptions;
 
 const MAX_UPLOAD_SIZE: usize = 100 * 1024 * 1024; // 100MB max file size
 
+// ============================================================
+// Authentication System - Extensible Design
+// ============================================================
+
+/// Authentication method configuration
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthMethod {
+    Password,
+    #[serde(skip)]
+    SSHKey, // Reserved for future implementation
+    None,   // No authentication
+}
+
+/// User credentials provided during authentication
+#[derive(Debug, Clone)]
+pub struct Credentials {
+    pub username: String,
+    pub password: Option<String>,
+    #[allow(dead_code)]
+    pub ssh_key: Option<String>, // Reserved for future SSH authentication
+}
+
+/// Trait for authentication strategies - allows easy extension
+pub trait Authenticator: Send + Sync {
+    /// Authenticate the provided credentials
+    fn authenticate(&self, credentials: &Credentials) -> bool;
+
+    /// Get the authentication method type
+    fn method(&self) -> AuthMethod;
+}
+
+/// Password-based authenticator implementation
+pub struct PasswordAuthenticator {
+    pub username: String,
+    pub password: String,
+}
+
+impl Authenticator for PasswordAuthenticator {
+    fn authenticate(&self, credentials: &Credentials) -> bool {
+        credentials.username == self.username
+            && credentials.password.as_ref().map_or(false, |p| p == &self.password)
+    }
+
+    fn method(&self) -> AuthMethod {
+        AuthMethod::Password
+    }
+}
+
+/// No-op authenticator for when authentication is disabled
+pub struct NoAuthenticator;
+
+impl Authenticator for NoAuthenticator {
+    fn authenticate(&self, _credentials: &Credentials) -> bool {
+        true
+    }
+
+    fn method(&self) -> AuthMethod {
+        AuthMethod::None
+    }
+}
+
+/// Configuration file structure
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Config {
+    pub server: ServerConfig,
+    pub auth: AuthConfig,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ServerConfig {
+    pub host: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AuthConfig {
+    pub enabled: bool,
+    pub method: String, // "password", "ssh_key", "none"
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            server: ServerConfig {
+                host: "0.0.0.0".to_string(),
+                port: 7681,  // Changed from 8080 to match config.toml.example
+            },
+            auth: AuthConfig {
+                enabled: false,
+                method: "none".to_string(),
+                username: None,
+                password: None,
+            },
+        }
+    }
+}
+
+/// Load configuration from file, or return default config
+fn load_config() -> Config {
+    // Try multiple possible config file locations
+    let config_paths = vec![
+        "config.toml",                              // Current directory
+        "/etc/ttyd/config.toml",                    // System-wide config
+    ];
+
+    for config_path in config_paths {
+        match fs::read_to_string(config_path) {
+            Ok(content) => {
+                info!("Found config file: {}", config_path);
+                match toml::from_str::<Config>(&content) {
+                    Ok(config) => {
+                        info!("Successfully loaded configuration from {}", config_path);
+                        info!("Server: {}:{}", config.server.host, config.server.port);
+                        info!("Auth: {} (method: {})",
+                            if config.auth.enabled { "enabled" } else { "disabled" },
+                            config.auth.method
+                        );
+                        return config;
+                    }
+                    Err(e) => {
+                        error!("Failed to parse config file '{}': {}", config_path, e);
+                        error!("Please check the file format. Using default configuration.");
+                        continue;
+                    }
+                }
+            }
+            Err(_) => {
+                // File not found, try next path
+                continue;
+            }
+        }
+    }
+
+    info!("No config file found, using default configuration");
+    info!("Default: server on 0.0.0.0:7681, authentication disabled");
+    Config::default()
+}
+
+/// Create authenticator based on configuration
+fn create_authenticator(config: &Config) -> Option<Box<dyn Authenticator>> {
+    if !config.auth.enabled {
+        info!("Authentication disabled");
+        return Some(Box::new(NoAuthenticator));
+    }
+
+    match config.auth.method.to_lowercase().as_str() {
+        "password" => {
+            // Require username and password to be explicitly set
+            let username = config.auth.username.as_ref()?;
+            let password = config.auth.password.as_ref()?;
+
+            info!("Password authentication enabled for user: {} {}", username, password);
+            Some(Box::new(PasswordAuthenticator {
+                username: username.clone(),
+                password: password.clone(),
+            }))
+        }
+        "ssh_key" => {
+            // Reserved for future implementation
+            error!("SSH key authentication not yet implemented");
+            None
+        }
+        "none" => {
+            info!("No authentication configured");
+            Some(Box::new(NoAuthenticator))
+        }
+        _ => {
+            error!("Unknown authentication method: {}", config.auth.method);
+            None
+        }
+    }
+}
+
+// ============================================================
+// End of Authentication System
+// ============================================================
+
 /// File information for directory listing
 #[derive(Debug, Serialize, Deserialize)]
 struct FileInfo {
@@ -190,16 +370,35 @@ fn get_html_content() -> String {
 async fn handle_websocket_connection(
     ws_stream: WebSocketStream<TcpStream>,
     current_dir: Arc<Mutex<PathBuf>>,
+    authenticator: Arc<Box<dyn Authenticator>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("New WebSocket connection established");
+
+    use tokio::sync::mpsc;
 
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     let pty_session = Arc::new(Mutex::new(PtySession::new()?));
     let pty_session_clone = pty_session.clone();
     let current_dir_clone = current_dir.clone();
 
+    // Create channel for control messages (auth responses, etc.)
+    let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<String>(32);
+
+    // Authentication state - shared between tasks
+    let auth_enabled = !matches!(authenticator.method(), AuthMethod::None);
+
     // Task 1: Forward PTY output to WebSocket
     let pty_to_ws_task = tokio::spawn(async move {
+        // Send auth required message immediately if authentication is enabled
+        if auth_enabled {
+            let auth_msg = serde_json::json!({"auth": "required"}).to_string();
+            if let Err(e) = ws_sender.send(Message::Text(auth_msg)).await {
+                error!("Failed to send auth required message: {}", e);
+                return;
+            }
+            info!("Sent auth required message to client");
+        }
+
         let mut interval = interval(Duration::from_millis(10));
         loop {
             interval.tick().await;
@@ -215,6 +414,13 @@ async fn handle_websocket_connection(
                     break;
                 }
             }
+
+            // Check for control messages
+            if let Ok(msg) = ctrl_rx.try_recv() {
+                if ws_sender.send(Message::Text(msg)).await.is_err() {
+                    break;
+                }
+            }
         }
     });
 
@@ -223,10 +429,51 @@ async fn handle_websocket_connection(
     let pty_session_for_sync2 = pty_session_clone.clone();
     let current_dir_for_ws = current_dir.clone();
     let ws_to_pty_task = tokio::spawn(async move {
+        let mut authenticated = !auth_enabled;
         let mut last_cmd = String::new();
+
         while let Some(result) = ws_receiver.next().await {
             match result {
                 Ok(Message::Text(text)) => {
+                    // Check if it's an authentication message
+                    if !authenticated {
+                        // Try to parse as JSON authentication message
+                        if let Ok(auth_msg) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if auth_msg.get("auth").and_then(|v| v.as_str()) == Some("login") {
+                                if let (Some(username), Some(password)) = (
+                                    auth_msg.get("username").and_then(|v| v.as_str()),
+                                    auth_msg.get("password").and_then(|v| v.as_str())
+                                ) {
+                                    let credentials = Credentials {
+                                        username: username.to_string(),
+                                        password: Some(password.to_string()),
+                                        ssh_key: None,
+                                    };
+
+                                    if authenticator.authenticate(&credentials) {
+                                        authenticated = true;
+                                        let _ = ctrl_tx.send(
+                                            serde_json::json!({"auth": "success"}).to_string()
+                                        ).await;
+                                        info!("Authentication successful for user: {}", username);
+                                        continue;
+                                    } else {
+                                        let _ = ctrl_tx.send(
+                                            serde_json::json!({"auth": "failed"}).to_string()
+                                        ).await;
+                                        info!("Authentication failed for user: {}", username);
+                                        // Continue to allow retry, don't break the connection
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Not authenticated and not a valid auth message, ignore it
+                        debug!("Ignoring non-auth message while not authenticated");
+                        continue;
+                    }
+
                     // Check if it's a resize message (JSON)
                     if text.starts_with('{') {
                         if let Ok(msg) = serde_json::from_str::<ResizeMessage>(&text) {
@@ -392,6 +639,7 @@ fn find_shell_cwd(pts_name: &str) -> Result<PathBuf, Box<dyn std::error::Error>>
 async fn handle_client(
     stream: TcpStream,
     current_dir: Arc<Mutex<std::path::PathBuf>>,
+    authenticator: Arc<Box<dyn Authenticator>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Peek at the first bytes to determine the request type without consuming them
     let mut peek_buffer = [0u8; 512];
@@ -401,7 +649,7 @@ async fn handle_client(
         Err(_) => {
             // Connection might be closed, try HTTP anyway
             let dir = current_dir.lock().await;
-            handle_http_connection(stream, dir.clone()).await?;
+            handle_http_connection(stream, dir.clone(), authenticator).await?;
             return Ok(());
         }
     }
@@ -413,7 +661,7 @@ async fn handle_client(
         // Use accept_async for WebSocket - it will handle the handshake
         match tokio_tungstenite::accept_async(stream).await {
             Ok(ws_stream) => {
-                handle_websocket_connection(ws_stream, current_dir).await?;
+                handle_websocket_connection(ws_stream, current_dir, authenticator).await?;
             }
             Err(e) => {
                 error!("WebSocket handshake failed: {}", e);
@@ -422,7 +670,7 @@ async fn handle_client(
     } else {
         // Handle as regular HTTP
         let dir = current_dir.lock().await;
-        handle_http_connection(stream, dir.clone()).await?;
+        handle_http_connection(stream, dir.clone(), authenticator).await?;
     }
 
     Ok(())
@@ -764,6 +1012,7 @@ fn create_zip_from_directory(dir_path: &Path) -> Result<Vec<u8>, Box<dyn std::er
 async fn handle_http_connection(
     mut stream: TcpStream,
     current_dir: std::path::PathBuf,
+    _authenticator: Arc<Box<dyn Authenticator>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Read HTTP headers first
     let mut header_buffer = vec![0u8; 8192];
@@ -945,10 +1194,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter_level(log::LevelFilter::Info)
         .init();
 
-    let host = "0.0.0.0";
-    let port = 7681;
+    // Load configuration
+    let config = load_config();
+
+    let host = config.server.host.as_str();
+    let port = config.server.port;
+
+    // Create authenticator
+    let authenticator = create_authenticator(&config)
+        .expect("Failed to create authenticator");
 
     info!("Starting TTYD server on {}:{}", host, port);
+    info!("Authentication: {}", if config.auth.enabled { "enabled" } else { "disabled" });
     info!("Open http://localhost:{} in your browser", port);
 
     let listener = TcpListener::bind((host, port)).await?;
@@ -956,13 +1213,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Shared current working directory state
     let current_dir = Arc::new(Mutex::new(env::current_dir()?));
 
+    // Wrap authenticator in Arc for sharing across connections
+    let authenticator = Arc::new(authenticator);
+
     loop {
         let (stream, addr) = listener.accept().await?;
         info!("New connection from {}", addr);
 
         let current_dir_clone = current_dir.clone();
+        let authenticator_clone = authenticator.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_client(stream, current_dir_clone).await {
+            if let Err(e) = handle_client(stream, current_dir_clone, authenticator_clone).await {
                 error!("Error handling client: {}", e);
             }
         });

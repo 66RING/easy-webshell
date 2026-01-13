@@ -245,6 +245,94 @@
             padding: 40px;
             color: #888;
         }
+        /* Login modal styles */
+        #login-modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.8);
+            z-index: 3000;
+            justify-content: center;
+            align-items: center;
+        }
+        #login-modal.active {
+            display: flex;
+        }
+        .login-content {
+            background: #252526;
+            border: 1px solid #454545;
+            border-radius: 8px;
+            padding: 30px;
+            width: 90%;
+            max-width: 400px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+        }
+        .login-content h2 {
+            color: #fff;
+            margin: 0 0 10px 0;
+            font-size: 20px;
+        }
+        .login-hint {
+            color: #888;
+            font-size: 14px;
+            margin-bottom: 20px;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        .form-group label {
+            display: block;
+            color: #ccc;
+            font-size: 13px;
+            margin-bottom: 5px;
+        }
+        .form-group input {
+            width: 100%;
+            background: #3c3c3c;
+            border: 1px solid #454545;
+            color: #fff;
+            padding: 10px 12px;
+            border-radius: 4px;
+            font-size: 14px;
+            box-sizing: border-box;
+        }
+        .form-group input:focus {
+            outline: none;
+            border-color: #2472c8;
+            background: #454545;
+        }
+        .btn-login {
+            width: 100%;
+            background: #2472c8;
+            color: #fff;
+            border: none;
+            padding: 10px;
+            border-radius: 4px;
+            font-size: 14px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .btn-login:hover:not(:disabled) {
+            background: #1e5fa8;
+        }
+        .btn-login:disabled {
+            background: #3c3c3c;
+            color: #888;
+            cursor: not-allowed;
+        }
+        .form-error {
+            background: #5a1d1d;
+            border: 1px solid #a33;
+            color: #ff9999;
+            padding: 10px;
+            border-radius: 4px;
+            font-size: 13px;
+            margin-bottom: 15px;
+        }
     </style>
 </head>
 <body>
@@ -254,6 +342,26 @@
         </svg>
         Download
     </button>
+
+    <!-- Login Modal -->
+    <div id="login-modal">
+        <div class="login-content">
+            <h2>Authentication Required</h2>
+            <p class="login-hint">Please log in to access the terminal</p>
+            <form id="login-form">
+                <div class="form-group">
+                    <label for="username">Username</label>
+                    <input type="text" id="username" name="username" required autocomplete="username">
+                </div>
+                <div class="form-group">
+                    <label for="password">Password</label>
+                    <input type="password" id="password" name="password" required autocomplete="current-password">
+                </div>
+                <div class="form-error" id="login-error" style="display: none;"></div>
+                <button type="submit" class="btn-login">Login</button>
+            </form>
+        </div>
+    </div>
 
     <!-- File Browser Modal -->
     <div id="file-browser-modal">
@@ -355,7 +463,9 @@
 
         // Track WebSocket connection state
         let wsConnected = false;
+        let authenticated = false;
         let pendingInput = [];
+        let pendingAuth = false;
 
         // Connect to WebSocket server
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -365,32 +475,89 @@
             console.log('WebSocket connected');
             wsConnected = true;
 
-            // Fit terminal to window size
-            fitTerminal();
-
-            // Send terminal size
-            const resize = {
-                cols: term.cols,
-                rows: term.rows
-            };
-            ws.send(JSON.stringify(resize));
-
-            // Send any pending input
-            while (pendingInput.length > 0) {
-                const data = pendingInput.shift();
-                ws.send(data);
-            }
+            // Show login modal if not authenticated
+            showLoginModal();
         };
 
         ws.onmessage = (event) => {
+            // Check if it's an authentication message
+            try {
+                const msg = JSON.parse(event.data);
+                if (msg.auth === 'required') {
+                    if (!authenticated && !pendingAuth) {
+                        showLoginModal();
+                    }
+                    return;
+                } else if (msg.auth === 'success') {
+                    authenticated = true;
+                    pendingAuth = false;
+
+                    // Reset button state
+                    const loginBtn = document.querySelector('.btn-login');
+                    loginBtn.disabled = false;
+                    loginBtn.textContent = 'Login';
+
+                    hideLoginModal();
+
+                    // Fit terminal to window size
+                    fitTerminal();
+
+                    // Send terminal size
+                    const resize = {
+                        cols: term.cols,
+                        rows: term.rows
+                    };
+                    ws.send(JSON.stringify(resize));
+
+                    // Send any pending input
+                    while (pendingInput.length > 0) {
+                        const data = pendingInput.shift();
+                        ws.send(data);
+                    }
+                    return;
+                } else if (msg.auth === 'failed') {
+                    pendingAuth = false;
+                    showLoginError('Invalid username or password');
+
+                    // Reset form state
+                    const loginBtn = document.querySelector('.btn-login');
+                    loginBtn.disabled = false;
+                    loginBtn.textContent = 'Login';
+
+                    // Clear password field and refocus
+                    document.getElementById('password').value = '';
+                    document.getElementById('password').focus();
+
+                    return;
+                }
+            } catch (e) {
+                // Not JSON, treat as regular terminal data
+            }
+
             // Write data from PTY to terminal
-            term.write(event.data);
+            if (authenticated) {
+                term.write(event.data);
+            }
         };
 
         ws.onclose = () => {
             console.log('WebSocket disconnected');
             wsConnected = false;
-            term.write('\r\n\x1b[31mConnection closed\x1b[0m');
+            authenticated = false;
+            pendingAuth = false;
+
+            // Show login modal with error if authentication was in progress
+            if (document.getElementById('login-modal').classList.contains('active') ||
+                !authenticated) {
+                showLoginModal();
+                showLoginError('Connection lost. Please refresh the page to reconnect.');
+                // Disable login form
+                const loginBtn = document.querySelector('.btn-login');
+                loginBtn.disabled = true;
+                loginBtn.textContent = 'Disconnected';
+            } else {
+                term.write('\r\n\x1b[31mConnection closed\x1b[0m');
+            }
         };
 
         ws.onerror = (error) => {
@@ -399,13 +566,71 @@
 
         // Send user input to PTY
         term.onData(data => {
-            if (wsConnected) {
+            if (wsConnected && authenticated) {
                 ws.send(data);
-            } else {
-                // Buffer input until WebSocket is connected
+            } else if (wsConnected) {
+                // Buffer input until authenticated
                 pendingInput.push(data);
             }
         });
+
+        // Login modal functions
+        function showLoginModal() {
+            document.getElementById('login-modal').classList.add('active');
+            document.getElementById('username').focus();
+        }
+
+        function hideLoginModal() {
+            document.getElementById('login-modal').classList.remove('active');
+        }
+
+        function showLoginError(message) {
+            const errorDiv = document.getElementById('login-error');
+            errorDiv.textContent = message;
+            errorDiv.style.display = 'block';
+        }
+
+        // Handle login form submission
+        document.getElementById('login-form').addEventListener('submit', (e) => {
+            e.preventDefault();
+
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+            const loginBtn = document.querySelector('.btn-login');
+
+            if (!username || !password) {
+                showLoginError('Please enter both username and password');
+                return;
+            }
+
+            // Disable button and show loading state
+            loginBtn.disabled = true;
+            loginBtn.textContent = 'Logging in...';
+
+            pendingAuth = true;
+            hideLoginError();
+
+            // Send authentication message
+            ws.send(JSON.stringify({
+                auth: 'login',
+                username: username,
+                password: password
+            }));
+
+            // Re-enable button after a timeout (in case of no response)
+            setTimeout(() => {
+                if (pendingAuth) {
+                    loginBtn.disabled = false;
+                    loginBtn.textContent = 'Login';
+                    showLoginError('Connection timeout. Please try again.');
+                    pendingAuth = false;
+                }
+            }, 10000);
+        });
+
+        function hideLoginError() {
+            document.getElementById('login-error').style.display = 'none';
+        }
 
         // Drag and drop file upload
         const dropOverlay = document.getElementById('drop-overlay');

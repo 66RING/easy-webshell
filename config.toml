@@ -1,0 +1,21 @@
+# TTYD Configuration File
+# Copy this file to config.toml and modify as needed
+
+[server]
+# Server bind address and port
+host = "0.0.0.0"
+port = 7681
+
+[auth]
+# Enable/disable authentication
+enabled = true
+
+# Authentication method: "password", "ssh_key" (not yet implemented), "none"
+method = "password"
+
+# Username for password authentication (required if method = "password")
+username = "admin"
+
+# Password for password authentication (required if method = "password")
+# IMPORTANT: Change this to a strong password in production!
+password = "66"
