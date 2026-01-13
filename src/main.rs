@@ -6,10 +6,10 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use std::ffi::CStr;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{Read, Write, Cursor};
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -19,7 +19,27 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::WebSocketStream;
 use tokio::time::{interval, Duration};
 
+use zip::{ZipWriter};
+use zip::write::FileOptions;
+
 const MAX_UPLOAD_SIZE: usize = 100 * 1024 * 1024; // 100MB max file size
+
+/// File information for directory listing
+#[derive(Debug, Serialize, Deserialize)]
+struct FileInfo {
+    name: String,
+    path: String,
+    is_dir: bool,
+    size: Option<u64>,
+    modified: Option<u64>,
+}
+
+/// Directory listing response
+#[derive(Debug, Serialize)]
+struct DirectoryListing {
+    current_path: String,
+    files: Vec<FileInfo>,
+}
 
 /// Terminal window size structure
 #[repr(C)]
@@ -530,6 +550,216 @@ async fn handle_file_upload(
     Ok(format!("File uploaded: {}", filename))
 }
 
+/// Handle file download request
+async fn handle_file_download(
+    query: &str,
+    current_dir: &std::path::PathBuf,
+) -> Result<(Vec<u8>, String), Box<dyn std::error::Error>> {
+    // Parse query parameter: ?path=/filename or ?path=relative/path/file.txt
+    let path_param = query
+        .strip_prefix("?path=")
+        .or_else(|| query.strip_prefix("path="))
+        .unwrap_or("");
+
+    if path_param.is_empty() {
+        return Err("No file path specified".into());
+    }
+
+    // Decode URL encoding
+    let decoded_path = url_decoding(path_param);
+
+    // If path is absolute, use it directly; otherwise, join with current directory
+    let file_path = if decoded_path.starts_with('/') {
+        PathBuf::from(&decoded_path)
+    } else {
+        current_dir.join(&decoded_path)
+    };
+
+    if !file_path.exists() {
+        return Err(format!("File not found: {}", file_path.display()).into());
+    }
+
+    // Check if it's a directory - if so, create a zip file
+    if file_path.is_dir() {
+        info!("Zipping directory: {}", file_path.display());
+        let zip_data = create_zip_from_directory(&file_path)?;
+
+        let dir_name = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("archive");
+
+        let filename = format!("{}.zip", dir_name);
+
+        // Determine content type for zip
+        let content_type = "application/zip".to_string();
+
+        info!("Directory zipped: {} -> {} ({} bytes)", file_path.display(), filename, zip_data.len());
+
+        // Return zip with special filename header
+        return Ok((zip_data, content_type));
+    }
+
+    // Read file content
+    let file_data = fs::read(&file_path)?;
+
+    // Determine content type
+    let content_type = mime_guess::from_path(&file_path)
+        .first_or_octet_stream()
+        .to_string();
+
+    info!("File downloaded: {} ({} bytes)", file_path.display(), file_data.len());
+
+    Ok((file_data, content_type))
+}
+
+/// Simple URL decoding (percent decoding)
+fn url_decoding(input: &str) -> String {
+    let mut result = String::new();
+    let mut chars = input.chars();
+
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let hex1 = chars.next();
+            let hex2 = chars.next();
+
+            if let (Some(h1), Some(h2)) = (hex1, hex2) {
+                if let (Some(d1), Some(d2)) = (h1.to_digit(16), h2.to_digit(16)) {
+                    let byte = (d1 * 16 + d2) as u8;
+                    result.push(byte as char);
+                } else {
+                    result.push(c);
+                    result.push(h1);
+                    result.push(h2);
+                }
+            } else {
+                result.push(c);
+            }
+        } else if c == '+' {
+            result.push(' ');
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}
+
+/// List files in a directory
+async fn handle_list_directory(
+    query: &str,
+    current_dir: &std::path::PathBuf,
+) -> Result<DirectoryListing, Box<dyn std::error::Error>> {
+    // Parse query parameter: ?path=/folder or ?path=relative/path
+    let path_param = query
+        .strip_prefix("?path=")
+        .or_else(|| query.strip_prefix("path="))
+        .unwrap_or("");
+
+    let target_path = if path_param.is_empty() || path_param == "." {
+        current_dir.clone()
+    } else {
+        let decoded_path = url_decoding(path_param);
+        if decoded_path.starts_with('/') {
+            PathBuf::from(&decoded_path)
+        } else {
+            current_dir.join(&decoded_path)
+        }
+    };
+
+    if !target_path.exists() {
+        return Err("Directory not found".into());
+    }
+
+    let mut files = Vec::new();
+
+    if target_path.is_dir() {
+        // List directory contents
+        let entries = fs::read_dir(&target_path)?;
+        for entry in entries {
+            let entry = entry?;
+            let metadata = entry.metadata().ok();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+            let size = if !is_dir {
+                metadata.as_ref().map(|m| m.len())
+            } else {
+                None
+            };
+            let modified = metadata.as_ref().and_then(|m| m.modified().ok()).map(|t| {
+                t.duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            });
+
+            // Skip hidden files
+            if !name.starts_with('.') {
+                files.push(FileInfo {
+                    path: entry.path().to_string_lossy().to_string(),
+                    name,
+                    is_dir,
+                    size,
+                    modified,
+                });
+            }
+        }
+    }
+
+    // Sort: directories first, then files
+    files.sort_by(|a, b| {
+        if a.is_dir && !b.is_dir {
+            return std::cmp::Ordering::Less;
+        } else if !a.is_dir && b.is_dir {
+            return std::cmp::Ordering::Greater;
+        }
+        a.name.cmp(&b.name)
+    });
+
+    Ok(DirectoryListing {
+        current_path: target_path.to_string_lossy().to_string(),
+        files,
+    })
+}
+
+/// Create a zip file from a directory
+fn create_zip_from_directory(dir_path: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut buffer = Vec::new();
+    let mut zip = ZipWriter::new(Cursor::new(&mut buffer));
+
+    let dir_name = dir_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("archive");
+
+    fn add_to_zip(zip: &mut ZipWriter<Cursor<&mut Vec<u8>>>, dir: &Path, base: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let options: FileOptions<'_, ()> = FileOptions::default();
+
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let name = path.strip_prefix(base)?.to_string_lossy().to_string();
+
+            if path.is_dir() {
+                zip.add_directory(name.clone(), options)?;
+                add_to_zip(zip, &path, base)?;
+            } else {
+                zip.start_file(name, options)?;
+                let mut file = File::open(&path)?;
+                let mut file_buffer = Vec::new();
+                file.read_to_end(&mut file_buffer)?;
+                zip.write_all(&file_buffer)?;
+            }
+        }
+        Ok(())
+    }
+
+    let base = dir_path.parent().unwrap_or_else(|| Path::new("."));
+    add_to_zip(&mut zip, dir_path, base)?;
+    zip.finish()?;
+
+    Ok(buffer)
+}
+
 /// Handle plain HTTP connection
 async fn handle_http_connection(
     mut stream: TcpStream,
@@ -576,9 +806,71 @@ async fn handle_http_connection(
     }
 
     let method = parts[0];
-    let path = parts[1];
+    let full_path = parts[1];
 
-    let (status, content_type, body) = if method == "POST" && path == "/upload" {
+    // Split path and query string
+    let (path, query) = if let Some(pos) = full_path.find('?') {
+        (&full_path[..pos], Some(&full_path[pos..]))
+    } else {
+        (full_path, None)
+    };
+
+    let (status, content_type, body) = if method == "GET" && path == "/download" {
+        // Handle file download
+        let query_str = query.unwrap_or("?path=");
+
+        // Process the download before any await
+        let download_result = handle_file_download(query_str, &current_dir).await;
+
+        // Extract file data and content type before any await
+        let result = download_result.map_err(|e| e.to_string());
+
+        match result {
+            Ok((file_data, content_type_header)) => {
+                // Extract filename from path for Content-Disposition header
+                let path_param = query_str
+                    .strip_prefix("?path=")
+                    .or_else(|| query_str.strip_prefix("path="))
+                    .unwrap_or("download");
+
+                let filename = path_param
+                    .split('/')
+                    .last()
+                    .unwrap_or("download");
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nContent-Disposition: attachment; filename=\"{}\"\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+                    content_type_header,
+                    file_data.len(),
+                    filename
+                );
+
+                stream.write_all(response.as_bytes()).await?;
+                stream.write_all(&file_data).await?;
+                stream.flush().await?;
+                return Ok(());
+            }
+            Err(e) => {
+                let error_msg = format!("Download failed: {}", e);
+                ("404 Not Found", "text/plain", error_msg)
+            }
+        }
+    } else if method == "GET" && path == "/ls" {
+        // Handle directory listing
+        let query_str = query.unwrap_or("?path=.");
+        let list_result = handle_list_directory(query_str, &current_dir).await;
+
+        match list_result {
+            Ok(listing) => {
+                let json_body = serde_json::to_string(&listing)?;
+                ("200 OK", "application/json", json_body)
+            }
+            Err(e) => {
+                let error_msg = format!("List failed: {}", e);
+                ("500 Internal Server Error", "application/json", format!(r#"{{"error":"{}"}}"#, error_msg))
+            }
+        }
+    } else if method == "POST" && path == "/upload" {
         // Extract Content-Length
         let content_length = request_lines
             .iter()

@@ -58,9 +58,221 @@
             font-size: 18px;
             font-weight: bold;
         }
+        /* Download button */
+        #download-btn {
+            position: fixed;
+            top: 10px;
+            right: 10px;
+            background: #2472c8;
+            color: #fff;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: bold;
+            z-index: 1000;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            transition: background 0.2s;
+        }
+        #download-btn:hover {
+            background: #1e5fa8;
+        }
+        #download-btn:active {
+            background: #194d8a;
+        }
+        /* File browser modal */
+        #file-browser-modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.7);
+            z-index: 2000;
+            justify-content: center;
+            align-items: center;
+        }
+        #file-browser-modal.active {
+            display: flex;
+        }
+        .file-browser-content {
+            background: #252526;
+            border: 1px solid #454545;
+            border-radius: 8px;
+            width: 80%;
+            max-width: 800px;
+            max-height: 80vh;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+        }
+        .file-browser-header {
+            padding: 20px;
+            border-bottom: 1px solid #454545;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .file-browser-header h2 {
+            margin: 0;
+            color: #fff;
+            font-size: 18px;
+        }
+        .browser-hint {
+            color: #888;
+            font-size: 12px;
+            margin-top: 5px;
+        }
+        .file-browser-close {
+            background: none;
+            border: none;
+            color: #fff;
+            font-size: 24px;
+            cursor: pointer;
+            padding: 0;
+            width: 30px;
+            height: 30px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 4px;
+        }
+        .file-browser-close:hover {
+            background: #454545;
+        }
+        .file-browser-path {
+            padding: 10px 20px;
+            background: #1e1e1e;
+            border-bottom: 1px solid #454545;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .file-browser-path input {
+            flex: 1;
+            background: #3c3c3c;
+            border: 1px solid #454545;
+            color: #fff;
+            padding: 8px 12px;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        .file-browser-path input:focus {
+            outline: none;
+            border-color: #2472c8;
+        }
+        .file-browser-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 10px;
+        }
+        .file-item {
+            display: flex;
+            align-items: center;
+            padding: 10px 15px;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background 0.2s;
+            margin-bottom: 2px;
+        }
+        .file-item:hover {
+            background: #2a2d2e;
+        }
+        .file-item.directory {
+            color: #0dbc79;
+        }
+        .file-item.directory .file-item-name::after {
+            content: ' (double-click to enter)';
+            font-size: 11px;
+            color: #666;
+            margin-left: 8px;
+        }
+        .file-item.file {
+            color: #fff;
+        }
+        .file-item-icon {
+            margin-right: 10px;
+            font-size: 18px;
+        }
+        .file-item-name {
+            flex: 1;
+        }
+        .file-item-size {
+            color: #888;
+            font-size: 12px;
+            margin-left: 10px;
+        }
+        .file-browser-footer {
+            padding: 15px 20px;
+            border-top: 1px solid #454545;
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+        }
+        .btn {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: background 0.2s;
+        }
+        .btn-cancel {
+            background: #3c3c3c;
+            color: #fff;
+        }
+        .btn-cancel:hover {
+            background: #4c4c4c;
+        }
+        .btn-download {
+            background: #2472c8;
+            color: #fff;
+        }
+        .btn-download:hover {
+            background: #1e5fa8;
+        }
+        .loading-spinner {
+            text-align: center;
+            padding: 40px;
+            color: #888;
+        }
     </style>
 </head>
 <body>
+    <button id="download-btn">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+            <path d="M8 12l-4-4h2.5V3h3v5H12l-4 4zm-6 1h12v2H2v-2z"/>
+        </svg>
+        Download
+    </button>
+
+    <!-- File Browser Modal -->
+    <div id="file-browser-modal">
+        <div class="file-browser-content">
+            <div class="file-browser-header">
+                <div>
+                    <h2>Download File</h2>
+                    <div class="browser-hint">Click to select • Double-click folder to enter • Folders download as ZIP</div>
+                </div>
+                <button class="file-browser-close" onclick="closeFileBrowser()">&times;</button>
+            </div>
+            <div class="file-browser-path">
+                <input type="text" id="current-path-input" readonly>
+            </div>
+            <div class="file-browser-list" id="file-list">
+                <div class="loading-spinner">Loading...</div>
+            </div>
+            <div class="file-browser-footer">
+                <button class="btn btn-cancel" onclick="closeFileBrowser()">Cancel</button>
+                <button class="btn btn-download" id="download-selected-btn" disabled>Download</button>
+            </div>
+        </div>
+    </div>
+
     <div id="drop-overlay">
         <div class="message">Drop file to upload</div>
     </div>
@@ -309,6 +521,184 @@
                 }
             }
             return false;
+        }
+
+        // Download file functionality - open file browser
+        const downloadBtn = document.getElementById('download-btn');
+        downloadBtn.addEventListener('click', () => {
+            openFileBrowser('.');
+        });
+
+        // File browser state
+        let currentBrowserPath = '.';
+        let selectedFile = null;
+
+        // Open file browser modal
+        function openFileBrowser(path) {
+            currentBrowserPath = path;
+            selectedFile = null;
+            document.getElementById('file-browser-modal').classList.add('active');
+            document.getElementById('download-selected-btn').disabled = true;
+            loadDirectory(path);
+        }
+
+        // Close file browser modal
+        function closeFileBrowser() {
+            document.getElementById('file-browser-modal').classList.remove('active');
+            selectedFile = null;
+        }
+
+        // Load directory contents
+        async function loadDirectory(path) {
+            const fileList = document.getElementById('file-list');
+            const pathInput = document.getElementById('current-path-input');
+            pathInput.value = path;
+            fileList.innerHTML = '<div class="loading-spinner">Loading...</div>';
+
+            try {
+                const encodedPath = encodeURIComponent(path);
+                const response = await fetch(`/ls?path=${encodedPath}`);
+
+                if (response.ok) {
+                    const data = await response.json();
+                    pathInput.value = data.current_path;
+                    renderFileList(data.files);
+                } else {
+                    fileList.innerHTML = '<div class="loading-spinner">Failed to load directory</div>';
+                }
+            } catch (error) {
+                fileList.innerHTML = '<div class="loading-spinner">Error: ' + error.message + '</div>';
+            }
+        }
+
+        // Render file list
+        function renderFileList(files) {
+            const fileList = document.getElementById('file-list');
+            fileList.innerHTML = '';
+
+            if (files.length === 0) {
+                fileList.innerHTML = '<div class="loading-spinner">Directory is empty</div>';
+                return;
+            }
+
+            // Add parent directory link if not at root
+            if (currentBrowserPath !== '.') {
+                const parentItem = document.createElement('div');
+                parentItem.className = 'file-item directory';
+                parentItem.innerHTML = '<span class="file-item-icon">📁</span><span class="file-item-name">.. (parent)</span>';
+                parentItem.onclick = () => {
+                    // Go to parent directory using ..
+                    const parentPath = currentBrowserPath === '.' ? '.' : (currentBrowserPath.includes('/') ? '..' : '.');
+                    openFileBrowser(parentPath);
+                };
+                fileList.appendChild(parentItem);
+            }
+
+            files.forEach(file => {
+                const item = document.createElement('div');
+                item.className = `file-item ${file.is_dir ? 'directory' : 'file'}`;
+                const icon = file.is_dir ? '📁' : '📄';
+                const size = file.size ? formatFileSize(file.size) : '';
+                item.innerHTML = `
+                    <span class="file-item-icon">${icon}</span>
+                    <span class="file-item-name">${file.name}</span>
+                    ${size ? `<span class="file-item-size">${size}</span>` : ''}
+                `;
+
+                // Single click: select the file/folder
+                item.onclick = () => {
+                    // Clear previous selection
+                    document.querySelectorAll('.file-item').forEach(el => el.style.background = '');
+                    item.style.background = '#2472c8';
+                    selectedFile = file;
+                    document.getElementById('download-selected-btn').disabled = false;
+                };
+
+                // Double click: enter directory
+                item.ondblclick = () => {
+                    if (file.is_dir) {
+                        // Build the correct path for the subdirectory
+                        let newPath;
+                        if (currentBrowserPath === '.') {
+                            newPath = file.name;
+                        } else {
+                            newPath = currentBrowserPath + '/' + file.name;
+                        }
+                        openFileBrowser(newPath);
+                    }
+                };
+
+                fileList.appendChild(item);
+            });
+        }
+
+        // Format file size
+        function formatFileSize(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+            if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+            return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+        }
+
+        // Download selected file
+        document.getElementById('download-selected-btn').addEventListener('click', async () => {
+            if (!selectedFile) return;
+
+            // Calculate relative path from current browser directory
+            let pathToDownload;
+            if (currentBrowserPath === '.') {
+                pathToDownload = selectedFile.name;
+            } else {
+                // Get the relative path by removing the current path prefix
+                if (selectedFile.path.startsWith(currentBrowserPath + '/')) {
+                    pathToDownload = selectedFile.path.substring(currentBrowserPath.length + 1);
+                } else {
+                    pathToDownload = selectedFile.name;
+                }
+            }
+
+            await downloadFile(pathToDownload, selectedFile.is_dir);
+            closeFileBrowser();
+        });
+
+        // Download file from server
+        async function downloadFile(path, isDir = false) {
+            try {
+                term.write('\r\n\x1b[33mDownloading: ' + path + (isDir ? ' (as ZIP)' : '') + '\x1b[0m\r\n');
+
+                const encodedPath = encodeURIComponent(path);
+                const response = await fetch(`/download?path=${encodedPath}`);
+
+                if (response.ok) {
+                    const contentDisposition = response.headers.get('Content-Disposition');
+                    let filename = path.split('/').pop();
+
+                    if (contentDisposition) {
+                        const filenameMatch = contentDisposition.match(/filename="(.+)"/);
+                        if (filenameMatch) {
+                            filename = filenameMatch[1];
+                        }
+                    }
+
+                    // Create blob and download link
+                    const blob = await response.blob();
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = filename;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    window.URL.revokeObjectURL(url);
+
+                    term.write('\r\n\x1b[32m✓ Downloaded: ' + filename + '\x1b[0m\r\n');
+                } else {
+                    const errorText = await response.text();
+                    term.write('\r\n\x1b[31m✗ Download failed: ' + errorText + '\x1b[0m\r\n');
+                }
+            } catch (error) {
+                term.write('\r\n\x1b[31m✗ Download error: ' + error.message + '\x1b[0m\r\n');
+            }
         }
     </script>
 </body>
