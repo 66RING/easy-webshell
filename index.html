@@ -160,10 +160,15 @@
             padding: 8px 12px;
             border-radius: 4px;
             font-size: 14px;
+            cursor: text;
         }
         .file-browser-path input:focus {
             outline: none;
             border-color: #2472c8;
+            background: #454545;
+        }
+        .file-browser-path input::placeholder {
+            color: #888;
         }
         .file-browser-list {
             flex: 1;
@@ -261,7 +266,7 @@
                 <button class="file-browser-close" onclick="closeFileBrowser()">&times;</button>
             </div>
             <div class="file-browser-path">
-                <input type="text" id="current-path-input" readonly>
+                <input type="text" id="current-path-input" placeholder="Enter path and press Enter (e.g., /home/user or ../subfolder)">
             </div>
             <div class="file-browser-list" id="file-list">
                 <div class="loading-spinner">Loading...</div>
@@ -535,7 +540,6 @@
 
         // Open file browser modal
         function openFileBrowser(path) {
-            currentBrowserPath = path;
             selectedFile = null;
             document.getElementById('file-browser-modal').classList.add('active');
             document.getElementById('download-selected-btn').disabled = true;
@@ -547,6 +551,19 @@
             document.getElementById('file-browser-modal').classList.remove('active');
             selectedFile = null;
         }
+
+        // Path input - handle Enter key
+        document.getElementById('current-path-input').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                const newPath = e.target.value.trim();
+                if (newPath) {
+                    currentBrowserPath = newPath;
+                    selectedFile = null;
+                    document.getElementById('download-selected-btn').disabled = true;
+                    loadDirectory(newPath);
+                }
+            }
+        });
 
         // Load directory contents
         async function loadDirectory(path) {
@@ -562,6 +579,8 @@
                 if (response.ok) {
                     const data = await response.json();
                     pathInput.value = data.current_path;
+                    // Update currentBrowserPath to the actual path from server
+                    currentBrowserPath = data.current_path;
                     renderFileList(data.files);
                 } else {
                     fileList.innerHTML = '<div class="loading-spinner">Failed to load directory</div>';
@@ -582,13 +601,24 @@
             }
 
             // Add parent directory link if not at root
-            if (currentBrowserPath !== '.') {
+            if (currentBrowserPath !== '.' && currentBrowserPath !== '/') {
                 const parentItem = document.createElement('div');
                 parentItem.className = 'file-item directory';
                 parentItem.innerHTML = '<span class="file-item-icon">📁</span><span class="file-item-name">.. (parent)</span>';
                 parentItem.onclick = () => {
-                    // Go to parent directory using ..
-                    const parentPath = currentBrowserPath === '.' ? '.' : (currentBrowserPath.includes('/') ? '..' : '.');
+                    // Calculate parent directory path
+                    let parentPath;
+                    if (currentBrowserPath.includes('/')) {
+                        // For paths like /home/user or /home/user/docs
+                        const parts = currentBrowserPath.split('/');
+                        parts.pop(); // Remove last segment
+                        parentPath = parts.join('/') || '/';
+                    } else {
+                        // For relative paths like subfolder or subfolder/inner
+                        const parts = currentBrowserPath.split('/');
+                        parts.pop();
+                        parentPath = parts.join('/') || '.';
+                    }
                     openFileBrowser(parentPath);
                 };
                 fileList.appendChild(parentItem);
@@ -644,20 +674,8 @@
         document.getElementById('download-selected-btn').addEventListener('click', async () => {
             if (!selectedFile) return;
 
-            // Calculate relative path from current browser directory
-            let pathToDownload;
-            if (currentBrowserPath === '.') {
-                pathToDownload = selectedFile.name;
-            } else {
-                // Get the relative path by removing the current path prefix
-                if (selectedFile.path.startsWith(currentBrowserPath + '/')) {
-                    pathToDownload = selectedFile.path.substring(currentBrowserPath.length + 1);
-                } else {
-                    pathToDownload = selectedFile.name;
-                }
-            }
-
-            await downloadFile(pathToDownload, selectedFile.is_dir);
+            // Use the full absolute path from server response
+            await downloadFile(selectedFile.path, selectedFile.is_dir);
             closeFileBrowser();
         });
 
