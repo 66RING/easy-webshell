@@ -833,7 +833,9 @@ async fn handle_http_connection(
                     .or_else(|| query_str.strip_prefix("path="))
                     .unwrap_or("download");
 
-                let filename = path_param
+                // Decode URL encoding first, then extract filename
+                let decoded_path = url_decoding(path_param);
+                let filename = decoded_path
                     .split('/')
                     .last()
                     .unwrap_or("download");
