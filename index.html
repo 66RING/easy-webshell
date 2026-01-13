@@ -28,6 +28,7 @@
         /* Prevent xterm from overflowing */
         .xterm-viewport {
             overflow-y: auto !important;
+            scroll-behavior: auto !important;
         }
         .xterm-screen {
             max-width: 100%;
@@ -537,6 +538,7 @@
             // Write data from PTY to terminal
             if (authenticated) {
                 term.write(event.data);
+                term.scrollToBottom();
             }
         };
 
