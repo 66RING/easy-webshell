@@ -1025,9 +1025,19 @@ async fn handle_http_connection(
         match result {
             Ok((file_data, content_type_header)) => {
                 // Extract filename from path for Content-Disposition header
+                // Parse query parameter to extract only the path part (ignore session_id)
                 let path_param = query_str
-                    .strip_prefix("?path=")
-                    .or_else(|| query_str.strip_prefix("path="))
+                    .strip_prefix("?")
+                    .unwrap_or(query_str)
+                    .split('&')
+                    .find_map(|p| {
+                        let p = p.trim_start_matches("path=");
+                        if p.contains('=') {
+                            None
+                        } else {
+                            Some(p)
+                        }
+                    })
                     .unwrap_or("download");
 
                 // Decode URL encoding first, then extract filename
