@@ -1,12 +1,12 @@
 use futures_util::{SinkExt, StreamExt};
-use libc::{c_ushort, fcntl, F_GETFL, F_SETFL, ioctl, O_NONBLOCK, TIOCSWINSZ};
+use libc::{c_ushort, fcntl, ioctl, F_GETFL, F_SETFL, O_NONBLOCK, TIOCSWINSZ};
 use log::{debug, error, info};
 use pty::fork::{Fork, Master};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::ffi::CStr;
 use std::fs::{self, File};
-use std::io::{Read, Write, Cursor};
+use std::io::{Cursor, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -15,204 +15,21 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
+use tokio::time::{interval, Duration};
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::WebSocketStream;
-use tokio::time::{interval, Duration};
 
-use zip::{ZipWriter};
+use crate::app::load_config;
+use crate::auth::create_authenticator;
+use crate::auth::{AuthMethod, Authenticator, Credentials};
+
 use zip::write::FileOptions;
+use zip::ZipWriter;
+
+mod app;
+mod auth;
 
 const MAX_UPLOAD_SIZE: usize = 100 * 1024 * 1024; // 100MB max file size
-
-// ============================================================
-// Authentication System - Extensible Design
-// ============================================================
-
-/// Authentication method configuration
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "lowercase")]
-pub enum AuthMethod {
-    Password,
-    #[serde(skip)]
-    SSHKey, // Reserved for future implementation
-    None,   // No authentication
-}
-
-/// User credentials provided during authentication
-#[derive(Debug, Clone)]
-pub struct Credentials {
-    pub username: String,
-    pub password: Option<String>,
-    #[allow(dead_code)]
-    pub ssh_key: Option<String>, // Reserved for future SSH authentication
-}
-
-/// Trait for authentication strategies - allows easy extension
-pub trait Authenticator: Send + Sync {
-    /// Authenticate the provided credentials
-    fn authenticate(&self, credentials: &Credentials) -> bool;
-
-    /// Get the authentication method type
-    fn method(&self) -> AuthMethod;
-}
-
-/// Password-based authenticator implementation
-pub struct PasswordAuthenticator {
-    pub username: String,
-    pub password: String,
-}
-
-impl Authenticator for PasswordAuthenticator {
-    fn authenticate(&self, credentials: &Credentials) -> bool {
-        credentials.username == self.username
-            && credentials.password.as_ref().map_or(false, |p| p == &self.password)
-    }
-
-    fn method(&self) -> AuthMethod {
-        AuthMethod::Password
-    }
-}
-
-/// No-op authenticator for when authentication is disabled
-pub struct NoAuthenticator;
-
-impl Authenticator for NoAuthenticator {
-    fn authenticate(&self, _credentials: &Credentials) -> bool {
-        true
-    }
-
-    fn method(&self) -> AuthMethod {
-        AuthMethod::None
-    }
-}
-
-/// Configuration file structure
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Config {
-    pub server: ServerConfig,
-    pub auth: AuthConfig,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ServerConfig {
-    pub host: String,
-    pub port: u16,
-    #[serde(default = "default_cur_dir")]
-    pub cur_dir: Option<String>,
-}
-
-fn default_cur_dir() -> Option<String> {
-    None
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct AuthConfig {
-    pub enabled: bool,
-    pub method: String, // "password", "ssh_key", "none"
-    pub username: Option<String>,
-    pub password: Option<String>,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig {
-                host: "0.0.0.0".to_string(),
-                port: 7681,  // Changed from 8080 to match config.toml.example
-                cur_dir: None,
-            },
-            auth: AuthConfig {
-                enabled: false,
-                method: "none".to_string(),
-                username: None,
-                password: None,
-            },
-        }
-    }
-}
-
-/// Load configuration from file, or return default config
-fn load_config() -> Config {
-    // Try multiple possible config file locations
-    let config_paths = vec![
-        "config.toml",                              // Current directory
-        "/etc/ttyd/config.toml",                    // System-wide config
-    ];
-
-    for config_path in config_paths {
-        match fs::read_to_string(config_path) {
-            Ok(content) => {
-                info!("Found config file: {}", config_path);
-                match toml::from_str::<Config>(&content) {
-                    Ok(config) => {
-                        info!("Successfully loaded configuration from {}", config_path);
-                        info!("Server: {}:{}", config.server.host, config.server.port);
-                        info!("Auth: {} (method: {})",
-                            if config.auth.enabled { "enabled" } else { "disabled" },
-                            config.auth.method
-                        );
-                        if let Some(ref dir) = config.server.cur_dir {
-                            info!("Working directory: {}", dir);
-                        }
-                        return config;
-                    }
-                    Err(e) => {
-                        error!("Failed to parse config file '{}': {}", config_path, e);
-                        error!("Please check the file format. Using default configuration.");
-                        continue;
-                    }
-                }
-            }
-            Err(_) => {
-                // File not found, try next path
-                continue;
-            }
-        }
-    }
-
-    info!("No config file found, using default configuration");
-    info!("Default: server on 0.0.0.0:7681, authentication disabled");
-    Config::default()
-}
-
-/// Create authenticator based on configuration
-fn create_authenticator(config: &Config) -> Option<Box<dyn Authenticator>> {
-    if !config.auth.enabled {
-        info!("Authentication disabled");
-        return Some(Box::new(NoAuthenticator));
-    }
-
-    match config.auth.method.to_lowercase().as_str() {
-        "password" => {
-            // Require username and password to be explicitly set
-            let username = config.auth.username.as_ref()?;
-            let password = config.auth.password.as_ref()?;
-
-            info!("Password authentication enabled for user: {} {}", username, password);
-            Some(Box::new(PasswordAuthenticator {
-                username: username.clone(),
-                password: password.clone(),
-            }))
-        }
-        "ssh_key" => {
-            // Reserved for future implementation
-            error!("SSH key authentication not yet implemented");
-            None
-        }
-        "none" => {
-            info!("No authentication configured");
-            Some(Box::new(NoAuthenticator))
-        }
-        _ => {
-            error!("Unknown authentication method: {}", config.auth.method);
-            None
-        }
-    }
-}
-
-// ============================================================
-// End of Authentication System
-// ============================================================
 
 /// File information for directory listing
 #[derive(Debug, Serialize, Deserialize)]
@@ -256,7 +73,11 @@ struct PtySession {
 
 impl PtySession {
     /// Create a new PTY session with specified size and initial directory
-    fn with_size_and_dir(cols: u16, rows: u16, initial_dir: Option<&PathBuf>) -> Result<Self, Box<dyn std::error::Error>> {
+    fn with_size_and_dir(
+        cols: u16,
+        rows: u16,
+        initial_dir: Option<&PathBuf>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
 
         let fork = Fork::from_ptmx()?;
@@ -272,11 +93,7 @@ impl PtySession {
             // Spawn shell
             let _ = Command::new(&shell).exec();
             // If exec returns, there was an error
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Failed to exec shell",
-            )
-            .into())
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "Failed to exec shell").into())
         } else {
             // Parent process
             let master = fork.is_parent()?;
@@ -371,11 +188,10 @@ impl Drop for PtySession {
 
 /// HTML content for the terminal interface
 fn get_html_content() -> String {
-    std::fs::read_to_string("index.html")
-        .unwrap_or_else(|e| {
-            error!("Failed to read index.html: {}", e);
-            "<html><body><h1>Error loading page</h1></body></html>".to_string()
-        })
+    std::fs::read_to_string("index.html").unwrap_or_else(|e| {
+        error!("Failed to read index.html: {}", e);
+        "<html><body><h1>Error loading page</h1></body></html>".to_string()
+    })
 }
 
 /// Handle WebSocket connection
@@ -396,7 +212,11 @@ async fn handle_websocket_connection(
         Some(dir.clone())
     };
 
-    let pty_session = Arc::new(Mutex::new(PtySession::with_size_and_dir(80, 24, initial_dir.as_ref())?));
+    let pty_session = Arc::new(Mutex::new(PtySession::with_size_and_dir(
+        80,
+        24,
+        initial_dir.as_ref(),
+    )?));
     let pty_session_clone = pty_session.clone();
     let current_dir_clone = current_dir.clone();
 
@@ -461,7 +281,7 @@ async fn handle_websocket_connection(
                             if auth_msg.get("auth").and_then(|v| v.as_str()) == Some("login") {
                                 if let (Some(username), Some(password)) = (
                                     auth_msg.get("username").and_then(|v| v.as_str()),
-                                    auth_msg.get("password").and_then(|v| v.as_str())
+                                    auth_msg.get("password").and_then(|v| v.as_str()),
                                 ) {
                                     let credentials = Credentials {
                                         username: username.to_string(),
@@ -471,15 +291,17 @@ async fn handle_websocket_connection(
 
                                     if authenticator.authenticate(&credentials) {
                                         authenticated = true;
-                                        let _ = ctrl_tx.send(
-                                            serde_json::json!({"auth": "success"}).to_string()
-                                        ).await;
+                                        let _ = ctrl_tx
+                                            .send(
+                                                serde_json::json!({"auth": "success"}).to_string(),
+                                            )
+                                            .await;
                                         info!("Authentication successful for user: {}", username);
                                         continue;
                                     } else {
-                                        let _ = ctrl_tx.send(
-                                            serde_json::json!({"auth": "failed"}).to_string()
-                                        ).await;
+                                        let _ = ctrl_tx
+                                            .send(serde_json::json!({"auth": "failed"}).to_string())
+                                            .await;
                                         info!("Authentication failed for user: {}", username);
                                         // Continue to allow retry, don't break the connection
                                         continue;
@@ -529,7 +351,13 @@ async fn handle_websocket_connection(
                         } else if text == "\u{7f}" || text == "\x08" {
                             // Backspace
                             last_cmd.pop();
-                        } else if text.len() == 1 && text.chars().next().map(|c| c.is_ascii_graphic()).unwrap_or(false) {
+                        } else if text.len() == 1
+                            && text
+                                .chars()
+                                .next()
+                                .map(|c| c.is_ascii_graphic())
+                                .unwrap_or(false)
+                        {
                             // Regular character
                             last_cmd.push(text.chars().next().unwrap());
                         }
@@ -605,7 +433,11 @@ async fn sync_current_directory(
             let old_dir = dir.clone();
             *dir = cwd.clone();
             if old_dir != *dir {
-                info!("Current directory updated: {} -> {}", old_dir.display(), dir.display());
+                info!(
+                    "Current directory updated: {} -> {}",
+                    old_dir.display(),
+                    dir.display()
+                );
             }
         }
     }
@@ -622,7 +454,11 @@ fn find_shell_cwd(pts_name: &str) -> Result<PathBuf, Box<dyn std::error::Error>>
     {
         let pid_str = entry.file_name();
         // Skip if not a numeric PID
-        if pid_str.to_string_lossy().chars().all(|c| c.is_ascii_digit()) {
+        if pid_str
+            .to_string_lossy()
+            .chars()
+            .all(|c| c.is_ascii_digit())
+        {
             let pid: u32 = pid_str.to_string_lossy().parse().unwrap_or(0);
             if pid == 0 || pid == std::process::id() {
                 continue;
@@ -861,7 +697,12 @@ async fn handle_file_download(
         // Determine content type for zip
         let content_type = "application/zip".to_string();
 
-        info!("Directory zipped: {} -> {} ({} bytes)", file_path.display(), filename, zip_data.len());
+        info!(
+            "Directory zipped: {} -> {} ({} bytes)",
+            file_path.display(),
+            filename,
+            zip_data.len()
+        );
 
         // Return zip with special filename header
         return Ok((zip_data, content_type));
@@ -875,7 +716,11 @@ async fn handle_file_download(
         .first_or_octet_stream()
         .to_string();
 
-    info!("File downloaded: {} ({} bytes)", file_path.display(), file_data.len());
+    info!(
+        "File downloaded: {} ({} bytes)",
+        file_path.display(),
+        file_data.len()
+    );
 
     Ok((file_data, content_type))
 }
@@ -998,7 +843,11 @@ fn create_zip_from_directory(dir_path: &Path) -> Result<Vec<u8>, Box<dyn std::er
         .and_then(|n| n.to_str())
         .unwrap_or("archive");
 
-    fn add_to_zip(zip: &mut ZipWriter<Cursor<&mut Vec<u8>>>, dir: &Path, base: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    fn add_to_zip(
+        zip: &mut ZipWriter<Cursor<&mut Vec<u8>>>,
+        dir: &Path,
+        base: &Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let options: FileOptions<'_, ()> = FileOptions::default();
 
         for entry in fs::read_dir(dir)? {
@@ -1048,7 +897,10 @@ async fn handle_http_connection(
         bytes_read += n;
 
         // Look for end of headers marker
-        if let Some(pos) = header_buffer[..bytes_read].windows(4).position(|w| w == b"\r\n\r\n") {
+        if let Some(pos) = header_buffer[..bytes_read]
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+        {
             total_read = bytes_read;
             header_end = pos + 4;
             break;
@@ -1103,10 +955,7 @@ async fn handle_http_connection(
 
                 // Decode URL encoding first, then extract filename
                 let decoded_path = url_decoding(path_param);
-                let filename = decoded_path
-                    .split('/')
-                    .last()
-                    .unwrap_or("download");
+                let filename = decoded_path.split('/').last().unwrap_or("download");
 
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nContent-Disposition: attachment; filename=\"{}\"\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
@@ -1137,7 +986,11 @@ async fn handle_http_connection(
             }
             Err(e) => {
                 let error_msg = format!("List failed: {}", e);
-                ("500 Internal Server Error", "application/json", format!(r#"{{"error":"{}"}}"#, error_msg))
+                (
+                    "500 Internal Server Error",
+                    "application/json",
+                    format!(r#"{{"error":"{}"}}"#, error_msg),
+                )
             }
         }
     } else if method == "POST" && path == "/upload" {
@@ -1153,7 +1006,10 @@ async fn handle_http_connection(
             (
                 "413 Payload Too Large",
                 "text/plain",
-                format!("File too large. Maximum size: {} MB", MAX_UPLOAD_SIZE / 1024 / 1024),
+                format!(
+                    "File too large. Maximum size: {} MB",
+                    MAX_UPLOAD_SIZE / 1024 / 1024
+                ),
             )
         } else {
             // Calculate body size already read
@@ -1183,7 +1039,11 @@ async fn handle_http_connection(
 
             match handle_file_upload(content_type_header, &request_buffer, &current_dir).await {
                 Ok(msg) => ("200 OK", "text/plain", msg),
-                Err(e) => ("400 Bad Request", "text/plain", format!("Upload failed: {}", e)),
+                Err(e) => (
+                    "400 Bad Request",
+                    "text/plain",
+                    format!("Upload failed: {}", e),
+                ),
             }
         }
     } else if path == "/" || path == "/index.html" {
@@ -1220,11 +1080,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port = config.server.port;
 
     // Create authenticator
-    let authenticator = create_authenticator(&config)
-        .expect("Failed to create authenticator");
+    let authenticator = create_authenticator(&config).expect("Failed to create authenticator");
 
     info!("Starting TTYD server on {}:{}", host, port);
-    info!("Authentication: {}", if config.auth.enabled { "enabled" } else { "disabled" });
+    info!(
+        "Authentication: {}",
+        if config.auth.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
     info!("Open http://localhost:{} in your browser", port);
 
     let listener = TcpListener::bind((host, port)).await?;
