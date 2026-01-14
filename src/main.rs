@@ -197,7 +197,7 @@ fn get_html_content() -> String {
 /// Handle WebSocket connection
 async fn handle_websocket_connection(
     ws_stream: WebSocketStream<TcpStream>,
-    current_dir: Arc<Mutex<PathBuf>>,
+    initial_config_dir: PathBuf,
     authenticator: Arc<Box<dyn Authenticator>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("New WebSocket connection established");
@@ -206,11 +206,9 @@ async fn handle_websocket_connection(
 
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
-    // Get initial directory for PTY session
-    let initial_dir = {
-        let dir = current_dir.lock().await;
-        Some(dir.clone())
-    };
+    // Create session-local current directory (not shared with other connections)
+    let session_current_dir = Arc::new(Mutex::new(initial_config_dir.clone()));
+    let initial_dir = Some(initial_config_dir.clone());
 
     let pty_session = Arc::new(Mutex::new(PtySession::with_size_and_dir(
         80,
@@ -218,7 +216,7 @@ async fn handle_websocket_connection(
         initial_dir.as_ref(),
     )?));
     let pty_session_clone = pty_session.clone();
-    let current_dir_clone = current_dir.clone();
+    let session_dir_clone = session_current_dir.clone();
 
     // Create channel for control messages (auth responses, etc.)
     let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<String>(32);
@@ -266,7 +264,7 @@ async fn handle_websocket_connection(
     // Task 2: Forward WebSocket input to PTY
     let pty_session_for_sync = pty_session_clone.clone();
     let pty_session_for_sync2 = pty_session_clone.clone();
-    let current_dir_for_ws = current_dir.clone();
+    let session_dir_for_ws = session_dir_clone.clone();
     let ws_to_pty_task = tokio::spawn(async move {
         let mut authenticated = !auth_enabled;
         let mut last_cmd = String::new();
@@ -340,7 +338,7 @@ async fn handle_websocket_connection(
                             if cmd.starts_with("cd ") || cmd == "cd" {
                                 // Sync current directory after cd command
                                 let pty = pty_session_for_sync.clone();
-                                let dir = current_dir_for_ws.clone();
+                                let dir = session_dir_for_ws.clone();
                                 tokio::spawn(async move {
                                     // Wait a bit for cd to complete
                                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -382,13 +380,14 @@ async fn handle_websocket_connection(
     });
 
     // Task 3: Periodically sync current directory
+    let session_dir_for_sync = session_current_dir.clone();
     let dir_sync_task = tokio::spawn(async move {
         let mut sync_interval = interval(Duration::from_secs(2));
         // Initial sync
         tokio::time::sleep(Duration::from_millis(500)).await;
         loop {
             sync_interval.tick().await;
-            sync_current_directory(pty_session_for_sync2.clone(), current_dir_clone.clone()).await;
+            sync_current_directory(pty_session_for_sync2.clone(), session_dir_for_sync.clone()).await;
         }
     });
 
@@ -493,6 +492,7 @@ fn find_shell_cwd(pts_name: &str) -> Result<PathBuf, Box<dyn std::error::Error>>
 /// Handle client connection
 async fn handle_client(
     stream: TcpStream,
+    initial_config_dir: PathBuf,
     current_dir: Arc<Mutex<std::path::PathBuf>>,
     authenticator: Arc<Box<dyn Authenticator>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -515,7 +515,7 @@ async fn handle_client(
         // Use accept_async for WebSocket - it will handle the handshake
         match tokio_tungstenite::accept_async(stream).await {
             Ok(ws_stream) => {
-                handle_websocket_connection(ws_stream, current_dir, authenticator).await?;
+                handle_websocket_connection(ws_stream, initial_config_dir, authenticator).await?;
             }
             Err(e) => {
                 error!("WebSocket handshake failed: {}", e);
@@ -648,7 +648,7 @@ async fn handle_file_upload(
         file_data.len()
     );
 
-    Ok(format!("File uploaded: {}", filename))
+    Ok(format!("File uploaded: {}", file_path.display()))
 }
 
 /// Handle file download request
@@ -1115,7 +1115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Working directory: {}", initial_dir.display());
 
-    let current_dir = Arc::new(Mutex::new(initial_dir));
+    let current_dir = Arc::new(Mutex::new(initial_dir.clone()));
 
     // Wrap authenticator in Arc for sharing across connections
     let authenticator = Arc::new(authenticator);
@@ -1125,9 +1125,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("New connection from {}", addr);
 
         let current_dir_clone = current_dir.clone();
+        let initial_dir_clone = initial_dir.clone();
         let authenticator_clone = authenticator.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_client(stream, current_dir_clone, authenticator_clone).await {
+            if let Err(e) = handle_client(stream, initial_dir_clone, current_dir_clone, authenticator_clone).await {
                 error!("Error handling client: {}", e);
             }
         });
