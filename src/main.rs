@@ -5,6 +5,7 @@ use pty::fork::{Fork, Master};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::ffi::CStr;
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Write};
 use std::os::fd::AsRawFd;
@@ -14,8 +15,8 @@ use std::process::Command;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
 use tokio::time::{interval, Duration};
+use tokio::sync::{Mutex, RwLock};
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::WebSocketStream;
 
@@ -31,6 +32,8 @@ mod auth;
 
 const MAX_UPLOAD_SIZE: usize = 100 * 1024 * 1024; // 100MB max file size
 
+// Session manager to track multiple WebSocket sessions
+type SessionManager = Arc<RwLock<HashMap<String, Arc<Mutex<PathBuf>>>>>;
 /// File information for directory listing
 #[derive(Debug, Serialize, Deserialize)]
 struct FileInfo {
@@ -198,16 +201,32 @@ fn get_html_content() -> String {
 async fn handle_websocket_connection(
     ws_stream: WebSocketStream<TcpStream>,
     initial_config_dir: PathBuf,
+    session_manager: SessionManager,
     authenticator: Arc<Box<dyn Authenticator>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("New WebSocket connection established");
 
     use tokio::sync::mpsc;
 
+    // Generate unique session ID
+    let session_id = format!("session_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros());
+
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
     // Create session-local current directory (not shared with other connections)
     let session_current_dir = Arc::new(Mutex::new(initial_config_dir.clone()));
+
+    // Register session
+    {
+        let mut sessions = session_manager.write().await;
+        sessions.insert(session_id.clone(), session_current_dir.clone());
+    }
+
     let initial_dir = Some(initial_config_dir.clone());
 
     let pty_session = Arc::new(Mutex::new(PtySession::with_size_and_dir(
@@ -224,17 +243,23 @@ async fn handle_websocket_connection(
     // Authentication state - shared between tasks
     let auth_enabled = !matches!(authenticator.method(), AuthMethod::None);
 
+    // Clone session_id for use in first task
+    let session_id_for_first_task = session_id.clone();
+
     // Task 1: Forward PTY output to WebSocket
     let pty_to_ws_task = tokio::spawn(async move {
-        // Send auth required message immediately if authentication is enabled
-        if auth_enabled {
-            let auth_msg = serde_json::json!({"auth": "required"}).to_string();
-            if let Err(e) = ws_sender.send(Message::Text(auth_msg)).await {
-                error!("Failed to send auth required message: {}", e);
-                return;
-            }
-            info!("Sent auth required message to client");
+        // Send session_id immediately after connection
+        let session_msg = if auth_enabled {
+            serde_json::json!({"auth": "required", "session_id": session_id_for_first_task}).to_string()
+        } else {
+            serde_json::json!({"auth": "success", "session_id": session_id_for_first_task}).to_string()
+        };
+
+        if let Err(e) = ws_sender.send(Message::Text(session_msg)).await {
+            error!("Failed to send session_id message: {}", e);
+            return;
         }
+        info!("Sent session_id {} to client", session_id_for_first_task);
 
         let mut interval = interval(Duration::from_millis(10));
         loop {
@@ -265,6 +290,7 @@ async fn handle_websocket_connection(
     let pty_session_for_sync = pty_session_clone.clone();
     let pty_session_for_sync2 = pty_session_clone.clone();
     let session_dir_for_ws = session_dir_clone.clone();
+    let session_id_for_ws = session_id.clone();
     let ws_to_pty_task = tokio::spawn(async move {
         let mut authenticated = !auth_enabled;
         let mut last_cmd = String::new();
@@ -289,11 +315,9 @@ async fn handle_websocket_connection(
 
                                     if authenticator.authenticate(&credentials) {
                                         authenticated = true;
-                                        let _ = ctrl_tx
-                                            .send(
-                                                serde_json::json!({"auth": "success"}).to_string(),
-                                            )
-                                            .await;
+                                        let _ = ctrl_tx.send(
+                                            serde_json::json!({"auth": "success", "session_id": session_id_for_ws}).to_string()
+                                        ).await;
                                         info!("Authentication successful for user: {}", username);
                                         continue;
                                     } else {
@@ -381,6 +405,8 @@ async fn handle_websocket_connection(
 
     // Task 3: Periodically sync current directory
     let session_dir_for_sync = session_current_dir.clone();
+    let session_manager_for_cleanup = session_manager.clone();
+    let session_id_for_cleanup = session_id.clone();
     let dir_sync_task = tokio::spawn(async move {
         let mut sync_interval = interval(Duration::from_secs(2));
         // Initial sync
@@ -404,7 +430,12 @@ async fn handle_websocket_connection(
         }
     }
 
-    info!("WebSocket connection closed");
+    // Clean up session
+    {
+        let mut sessions = session_manager_for_cleanup.write().await;
+        sessions.remove(&session_id_for_cleanup);
+    }
+    info!("WebSocket connection closed, session {} removed", session_id_for_cleanup);
     Ok(())
 }
 
@@ -493,7 +524,7 @@ fn find_shell_cwd(pts_name: &str) -> Result<PathBuf, Box<dyn std::error::Error>>
 async fn handle_client(
     stream: TcpStream,
     initial_config_dir: PathBuf,
-    current_dir: Arc<Mutex<std::path::PathBuf>>,
+    session_manager: SessionManager,
     authenticator: Arc<Box<dyn Authenticator>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Peek at the first bytes to determine the request type without consuming them
@@ -503,7 +534,7 @@ async fn handle_client(
         Ok(_) => {}
         Err(_) => {
             // Connection might be closed, try HTTP anyway
-            handle_http_connection(stream, current_dir.clone(), authenticator).await?;
+            handle_http_connection(stream, initial_config_dir.clone(), session_manager.clone(), authenticator).await?;
             return Ok(());
         }
     }
@@ -515,7 +546,7 @@ async fn handle_client(
         // Use accept_async for WebSocket - it will handle the handshake
         match tokio_tungstenite::accept_async(stream).await {
             Ok(ws_stream) => {
-                handle_websocket_connection(ws_stream, initial_config_dir, authenticator).await?;
+                handle_websocket_connection(ws_stream, initial_config_dir, session_manager, authenticator).await?;
             }
             Err(e) => {
                 error!("WebSocket handshake failed: {}", e);
@@ -523,7 +554,7 @@ async fn handle_client(
         }
     } else {
         // Handle as regular HTTP
-        handle_http_connection(stream, current_dir.clone(), authenticator).await?;
+        handle_http_connection(stream, initial_config_dir, session_manager, authenticator).await?;
     }
 
     Ok(())
@@ -656,10 +687,19 @@ async fn handle_file_download(
     query: &str,
     current_dir: &std::path::PathBuf,
 ) -> Result<(Vec<u8>, String), Box<dyn std::error::Error>> {
-    // Parse query parameter: ?path=/filename or ?path=relative/path/file.txt
+    // Parse query parameter: ?path=/filename or ?path=relative/path/file.txt or ?path=file.txt&session_id=xxx
     let path_param = query
-        .strip_prefix("?path=")
-        .or_else(|| query.strip_prefix("path="))
+        .strip_prefix("?")
+        .unwrap_or(query)
+        .split('&')
+        .find_map(|p| {
+            let p = p.trim_start_matches("path=");
+            if p.contains('=') {
+                None
+            } else {
+                Some(p)
+            }
+        })
         .unwrap_or("");
 
     if path_param.is_empty() {
@@ -760,10 +800,19 @@ async fn handle_list_directory(
     query: &str,
     current_dir: &std::path::PathBuf,
 ) -> Result<DirectoryListing, Box<dyn std::error::Error>> {
-    // Parse query parameter: ?path=/folder or ?path=relative/path
+    // Parse query parameter: ?path=/folder or ?path=relative/path or ?path=.&session_id=xxx
     let path_param = query
-        .strip_prefix("?path=")
-        .or_else(|| query.strip_prefix("path="))
+        .strip_prefix("?")
+        .unwrap_or(query)
+        .split('&')
+        .find_map(|p| {
+            let p = p.trim_start_matches("path=");
+            if p.contains('=') {
+                None
+            } else {
+                Some(p)
+            }
+        })
         .unwrap_or("");
 
     let target_path = if path_param.is_empty() || path_param == "." {
@@ -874,10 +923,24 @@ fn create_zip_from_directory(dir_path: &Path) -> Result<Vec<u8>, Box<dyn std::er
     Ok(buffer)
 }
 
+/// Extract session_id from query string
+fn extract_session_id_from_query(query: &str) -> Option<String> {
+    query.split('&')
+        .find_map(|p| {
+            let p = p.trim_start_matches('?');
+            if p.starts_with("session_id=") {
+                Some(p["session_id=".len()..].to_string())
+            } else {
+                None
+            }
+        })
+}
+
 /// Handle plain HTTP connection
 async fn handle_http_connection(
     mut stream: TcpStream,
-    current_dir: Arc<Mutex<std::path::PathBuf>>,
+    initial_config_dir: PathBuf,
+    session_manager: SessionManager,
     _authenticator: Arc<Box<dyn Authenticator>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Read HTTP headers first
@@ -937,8 +1000,21 @@ async fn handle_http_connection(
         // Handle file download
         let query_str = query.unwrap_or("?path=");
 
-        // Get current directory at request time
-        let dir = current_dir.lock().await;
+        // Extract session_id from query parameters or use default directory
+        let session_id = extract_session_id_from_query(query_str);
+        let dir = if let Some(sid) = session_id {
+            let sessions = session_manager.read().await;
+            sessions.get(&sid).map(|d| d.clone())
+        } else {
+            None
+        };
+
+        // Use session directory or fall back to initial config directory
+        let dir = if let Some(d) = dir {
+            d.lock().await.clone()
+        } else {
+            initial_config_dir.clone()
+        };
 
         // Process the download before any await
         let download_result = handle_file_download(query_str, &dir).await;
@@ -978,7 +1054,26 @@ async fn handle_http_connection(
     } else if method == "GET" && path == "/ls" {
         // Handle directory listing
         let query_str = query.unwrap_or("?path=.");
-        let dir = current_dir.lock().await;
+        let session_id = extract_session_id_from_query(query_str);
+        debug!("LS request: query={}, session_id={:?}", query_str, session_id);
+
+        let dir = if let Some(sid) = session_id {
+            let sessions = session_manager.read().await;
+            sessions.get(&sid).map(|d| d.clone())
+        } else {
+            debug!("No session_id found, using initial_config_dir");
+            None
+        };
+
+        let dir = if let Some(d) = dir {
+            let d = d.lock().await.clone();
+            debug!("Using session directory: {}", d.display());
+            d
+        } else {
+            debug!("Using initial config directory: {}", initial_config_dir.display());
+            initial_config_dir.clone()
+        };
+
         let list_result = handle_list_directory(query_str, &dir).await;
 
         match list_result {
@@ -1039,7 +1134,25 @@ async fn handle_http_connection(
                 .map(|s| s.trim())
                 .unwrap_or("");
 
-            let dir = current_dir.lock().await;
+            // Extract session_id from headers or query parameters
+            let session_id = request_lines
+                .iter()
+                .find(|line| line.to_lowercase().starts_with("x-session-id:"))
+                .and_then(|line| line.split(':').nth(1))
+                .map(|s| s.trim().to_string())
+                .or_else(|| extract_session_id_from_query(query.unwrap_or("?path=")));
+
+            let dir = if let Some(sid) = session_id {
+                let sessions = session_manager.read().await;
+                sessions.get(&sid).map(|d| d.clone())
+            } else {
+                None
+            };
+            let dir = if let Some(d) = dir {
+                d.lock().await.clone()
+            } else {
+                initial_config_dir.clone()
+            };
             match handle_file_upload(content_type_header, &request_buffer, &dir).await {
                 Ok(msg) => ("200 OK", "text/plain", msg),
                 Err(e) => (
@@ -1115,7 +1228,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Working directory: {}", initial_dir.display());
 
-    let current_dir = Arc::new(Mutex::new(initial_dir.clone()));
+    // Create session manager to track multiple WebSocket sessions
+    let session_manager: SessionManager = Arc::new(RwLock::new(HashMap::new()));
 
     // Wrap authenticator in Arc for sharing across connections
     let authenticator = Arc::new(authenticator);
@@ -1124,11 +1238,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (stream, addr) = listener.accept().await?;
         info!("New connection from {}", addr);
 
-        let current_dir_clone = current_dir.clone();
         let initial_dir_clone = initial_dir.clone();
+        let session_manager_clone = session_manager.clone();
         let authenticator_clone = authenticator.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_client(stream, initial_dir_clone, current_dir_clone, authenticator_clone).await {
+            if let Err(e) = handle_client(stream, initial_dir_clone, session_manager_clone, authenticator_clone).await {
                 error!("Error handling client: {}", e);
             }
         });

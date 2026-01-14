@@ -467,6 +467,7 @@
         let authenticated = false;
         let pendingInput = [];
         let pendingAuth = false;
+        let sessionId = null;
 
         // Connect to WebSocket server
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -485,6 +486,11 @@
             try {
                 const msg = JSON.parse(event.data);
                 if (msg.auth === 'required') {
+                    // Save session_id even during auth requirement
+                    if (msg.session_id) {
+                        sessionId = msg.session_id;
+                        console.log('Session ID (auth required):', sessionId);
+                    }
                     if (!authenticated && !pendingAuth) {
                         showLoginModal();
                     }
@@ -492,6 +498,12 @@
                 } else if (msg.auth === 'success') {
                     authenticated = true;
                     pendingAuth = false;
+
+                    // Save session_id for subsequent requests
+                    if (msg.session_id) {
+                        sessionId = msg.session_id;
+                        console.log('Session ID (auth success):', sessionId);
+                    }
 
                     // Reset button state
                     const loginBtn = document.querySelector('.btn-login');
@@ -723,14 +735,20 @@
             const blob = file instanceof Blob ? file : new Blob([file], { type: file.type || 'application/octet-stream' });
             formData.append('file', blob, path);
 
+            // Prepare headers with session_id
+            const headers = {
+                'X-Upload-Path': path
+            };
+            if (sessionId) {
+                headers['X-Session-Id'] = sessionId;
+            }
+
             for (let attempt = 1; attempt <= maxRetries; attempt++) {
                 try {
                     const response = await fetch('/upload', {
                         method: 'POST',
                         body: formData,
-                        headers: {
-                            'X-Upload-Path': path
-                        }
+                        headers: headers
                     });
 
                     if (response.ok) {
@@ -801,7 +819,8 @@
 
             try {
                 const encodedPath = encodeURIComponent(path);
-                const response = await fetch(`/ls?path=${encodedPath}`);
+                const sessionParam = sessionId ? `&session_id=${encodeURIComponent(sessionId)}` : '';
+                const response = await fetch(`/ls?path=${encodedPath}${sessionParam}`);
 
                 if (response.ok) {
                     const data = await response.json();
@@ -912,7 +931,8 @@
                 term.write('\r\n\x1b[33mDownloading: ' + path + (isDir ? ' (as ZIP)' : '') + '\x1b[0m\r\n');
 
                 const encodedPath = encodeURIComponent(path);
-                const response = await fetch(`/download?path=${encodedPath}`);
+                const sessionParam = sessionId ? `&session_id=${encodeURIComponent(sessionId)}` : '';
+                const response = await fetch(`/download?path=${encodedPath}${sessionParam}`);
 
                 if (response.ok) {
                     const contentDisposition = response.headers.get('Content-Disposition');
