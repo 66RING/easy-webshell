@@ -503,8 +503,7 @@ async fn handle_client(
         Ok(_) => {}
         Err(_) => {
             // Connection might be closed, try HTTP anyway
-            let dir = current_dir.lock().await;
-            handle_http_connection(stream, dir.clone(), authenticator).await?;
+            handle_http_connection(stream, current_dir.clone(), authenticator).await?;
             return Ok(());
         }
     }
@@ -524,8 +523,7 @@ async fn handle_client(
         }
     } else {
         // Handle as regular HTTP
-        let dir = current_dir.lock().await;
-        handle_http_connection(stream, dir.clone(), authenticator).await?;
+        handle_http_connection(stream, current_dir.clone(), authenticator).await?;
     }
 
     Ok(())
@@ -879,7 +877,7 @@ fn create_zip_from_directory(dir_path: &Path) -> Result<Vec<u8>, Box<dyn std::er
 /// Handle plain HTTP connection
 async fn handle_http_connection(
     mut stream: TcpStream,
-    current_dir: std::path::PathBuf,
+    current_dir: Arc<Mutex<std::path::PathBuf>>,
     _authenticator: Arc<Box<dyn Authenticator>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Read HTTP headers first
@@ -939,8 +937,11 @@ async fn handle_http_connection(
         // Handle file download
         let query_str = query.unwrap_or("?path=");
 
+        // Get current directory at request time
+        let dir = current_dir.lock().await;
+
         // Process the download before any await
-        let download_result = handle_file_download(query_str, &current_dir).await;
+        let download_result = handle_file_download(query_str, &dir).await;
 
         // Extract file data and content type before any await
         let result = download_result.map_err(|e| e.to_string());
@@ -977,7 +978,8 @@ async fn handle_http_connection(
     } else if method == "GET" && path == "/ls" {
         // Handle directory listing
         let query_str = query.unwrap_or("?path=.");
-        let list_result = handle_list_directory(query_str, &current_dir).await;
+        let dir = current_dir.lock().await;
+        let list_result = handle_list_directory(query_str, &dir).await;
 
         match list_result {
             Ok(listing) => {
@@ -1037,7 +1039,8 @@ async fn handle_http_connection(
                 .map(|s| s.trim())
                 .unwrap_or("");
 
-            match handle_file_upload(content_type_header, &request_buffer, &current_dir).await {
+            let dir = current_dir.lock().await;
+            match handle_file_upload(content_type_header, &request_buffer, &dir).await {
                 Ok(msg) => ("200 OK", "text/plain", msg),
                 Err(e) => (
                     "400 Bad Request",
