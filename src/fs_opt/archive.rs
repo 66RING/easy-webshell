@@ -5,16 +5,10 @@ use std::path::Path;
 use zip::write::FileOptions;
 use zip::ZipWriter;
 
-
 /// Create a zip file from a directory
 pub fn create_zip_from_directory(dir_path: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut buffer = Vec::new();
     let mut zip = ZipWriter::new(Cursor::new(&mut buffer));
-
-    let dir_name = dir_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("archive");
 
     fn add_to_zip(
         zip: &mut ZipWriter<Cursor<&mut Vec<u8>>>,

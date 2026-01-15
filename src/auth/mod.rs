@@ -13,6 +13,7 @@ mod password_auth;
 pub enum AuthMethod {
     Password,
     #[serde(skip)]
+    #[allow(dead_code)]
     SSHKey, // Reserved for future implementation
     None, // No authentication
 }

@@ -1,12 +1,15 @@
 use libc::{c_ushort, fcntl, ioctl, F_GETFL, F_SETFL, O_NONBLOCK, TIOCSWINSZ};
+use log::{debug, info};
 use pty::fork::{Fork, Master};
-use std::env;
 use std::ffi::CStr;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
+use std::{env, fs};
+use tokio::sync::Mutex;
 
 /// Terminal window size structure
 #[repr(C)]
@@ -138,4 +141,94 @@ impl Drop for PtySession {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+/// Sync current working directory from PTY
+pub async fn sync_current_directory(
+    pty_session: Arc<Mutex<PtySession>>,
+    current_dir: Arc<Mutex<PathBuf>>,
+) {
+    // Get the PTS name from the session
+    let pts_name = {
+        let session = pty_session.lock().await;
+        session.pts_name.clone()
+    };
+
+    if let Some(pts) = pts_name {
+        // Find the process that has this PTY as its controlling terminal
+        // by looking at /proc/[pid]/fd/0 (stdin) or /proc/[pid]/fd/1 (stdout)
+        let cwd = find_shell_cwd(&pts);
+
+        // Handle the result before any await
+        let cwd_opt = cwd.ok();
+
+        if let Some(cwd) = cwd_opt {
+            let mut dir = current_dir.lock().await;
+            let old_dir = dir.clone();
+            *dir = cwd.clone();
+            if old_dir != *dir {
+                info!(
+                    "Current directory updated: {} -> {}",
+                    old_dir.display(),
+                    dir.display()
+                );
+            }
+        }
+    }
+}
+
+/// Find the shell's current working directory by PTY device
+/// by looking at /proc/[pid]/fd/0 (stdin) or /proc/[pid]/fd/1 (stdout)
+/// if the fd_id was link to the target pts device. the process found.
+///
+/// Linux fs tips: every thing is a file.
+/// process state: /proc/[pid]
+///     opened file: /proc/[pid]/fd (a link to target file/device)
+///     cwd: /proc/[pid]/cwd (a link)
+///     ...
+fn find_shell_cwd(pts_name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let proc_path = PathBuf::from("/proc");
+
+    // Iterate through all process directories in /proc
+    for entry in fs::read_dir(&proc_path)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+    {
+        let pid_str = entry.file_name();
+        // Skip if not a numeric PID
+        if pid_str
+            .to_string_lossy()
+            .chars()
+            .all(|c| c.is_ascii_digit())
+        {
+            let pid: u32 = pid_str.to_string_lossy().parse().unwrap_or(0);
+            if pid == 0 || pid == std::process::id() {
+                continue;
+            }
+
+            // Check if this process has the PTY as its stdin/stdout/stderr
+            // TODO: 新增一些pty的debug信息, 比如pts name
+            let fds_path = entry.path().join("fd");
+            if let Ok(fds) = fs::read_dir(&fds_path) {
+                for fd_entry in fds.filter_map(|e| e.ok()) {
+                    if let Ok(target) = fs::read_link(&fd_entry.path()) {
+                        let target_str = target.to_string_lossy();
+                        // Check if this fd points to our PTY
+                        if target_str.contains(pts_name) || target_str == pts_name {
+                            // Found the process! Now get its cwd
+                            let cwd_path = entry.path().join("cwd");
+                            if let Ok(cwd) = fs::read_link(&cwd_path) {
+                                debug!("Found shell PID {} with cwd: {}", pid, cwd.display());
+                                return Ok(cwd);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: return current directory
+    debug!("Could not find shell process, using current directory");
+    Ok(env::current_dir()?)
 }

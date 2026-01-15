@@ -1,16 +1,13 @@
-use crate::handler::http_handlers::{
-    get_html_content, handle_file_download, handle_file_upload, handle_list_directory, url_decoding
+use crate::api::http_handlers::{
+    get_html_content, handle_file_download, handle_file_upload, handle_list_directory, url_decoding,
 };
-use crate::session::{SessionManager, extract_session_id_from_query};
 use crate::auth::Authenticator;
-use futures_util::{SinkExt, StreamExt};
+use crate::session::{extract_session_id_from_query, SessionManager};
 use log::debug;
-use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-
 
 const MAX_UPLOAD_SIZE: usize = 100 * 1024 * 1024; // 100MB max file size
 
