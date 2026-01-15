@@ -1,67 +1,37 @@
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
-use std::env;
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{Cursor, Read, Write};
-use std::path::{Path, PathBuf};
+use std::env;
+use std::fs::{self};
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::{interval, Duration};
 use tokio::sync::{Mutex, RwLock};
+use tokio::time::{interval, Duration};
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::WebSocketStream;
 
-use crate::config::load_config;
 use crate::auth::create_authenticator;
 use crate::auth::{AuthMethod, Authenticator, Credentials};
+use crate::config::load_config;
+use crate::connection::http::handle_http_connection;
+use crate::session::SessionManager;
 use crate::shell::PtySession;
 
-use zip::write::FileOptions;
-use zip::ZipWriter;
-
-mod config;
 mod auth;
+mod config;
+mod connection;
+mod fs_opt;
+mod handler;
+mod session;
 mod shell;
-
-const MAX_UPLOAD_SIZE: usize = 100 * 1024 * 1024; // 100MB max file size
-
-// Session manager to track multiple WebSocket sessions
-// TODO: a wrapper class
-type SessionManager = Arc<RwLock<HashMap<String, Arc<Mutex<PathBuf>>>>>;
-/// File information for directory listing
-#[derive(Debug, Serialize, Deserialize)]
-struct FileInfo {
-    name: String,
-    path: String,
-    is_dir: bool,
-    size: Option<u64>,
-    modified: Option<u64>,
-}
-
-/// Directory listing response
-#[derive(Debug, Serialize)]
-struct DirectoryListing {
-    current_path: String,
-    files: Vec<FileInfo>,
-}
 
 /// Resize message from client
 #[derive(Debug, Serialize, Deserialize)]
 struct ResizeMessage {
     cols: u16,
     rows: u16,
-}
-
-
-/// HTML content for the terminal interface
-fn get_html_content() -> String {
-    std::fs::read_to_string("index.html").unwrap_or_else(|e| {
-        error!("Failed to read index.html: {}", e);
-        "<html><body><h1>Error loading page</h1></body></html>".to_string()
-    })
 }
 
 /// Handle WebSocket connection
@@ -80,12 +50,14 @@ async fn handle_websocket_connection(
     use tokio::sync::mpsc;
 
     // Generate unique session ID
-    let session_id = format!("session_{}_{}",
+    let session_id = format!(
+        "session_{}_{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_micros());
+            .as_micros()
+    );
 
     // TODO: review为什么sink是sender， stream是receiver
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
@@ -131,9 +103,11 @@ async fn handle_websocket_connection(
         // TODO: 登录后再send?
         // 这里发送信号给前端: 需要认证还是不需要
         let session_msg = if auth_enabled {
-            serde_json::json!({"auth": "required", "session_id": session_id_for_first_task}).to_string()
+            serde_json::json!({"auth": "required", "session_id": session_id_for_first_task})
+                .to_string()
         } else {
-            serde_json::json!({"auth": "success", "session_id": session_id_for_first_task}).to_string()
+            serde_json::json!({"auth": "success", "session_id": session_id_for_first_task})
+                .to_string()
         };
 
         if let Err(e) = ws_sender.send(Message::Text(session_msg)).await {
@@ -281,7 +255,8 @@ async fn handle_websocket_connection(
         tokio::time::sleep(Duration::from_millis(100)).await;
         loop {
             sync_interval.tick().await;
-            sync_current_directory(pty_session_for_sync.clone(), session_dir_for_sync.clone()).await;
+            sync_current_directory(pty_session_for_sync.clone(), session_dir_for_sync.clone())
+                .await;
         }
     });
 
@@ -303,7 +278,10 @@ async fn handle_websocket_connection(
         let mut sessions = session_manager_for_cleanup.write().await;
         sessions.remove(&session_id_for_cleanup);
     }
-    info!("WebSocket connection closed, session {} removed", session_id_for_cleanup);
+    info!(
+        "WebSocket connection closed, session {} removed",
+        session_id_for_cleanup
+    );
     Ok(())
 }
 
@@ -415,7 +393,13 @@ async fn handle_client(
             // Connection might be closed, try HTTP anyway
             // TODO: review why?
             // also as a http server?
-            handle_http_connection(stream, initial_config_dir.clone(), session_manager.clone(), authenticator).await?;
+            handle_http_connection(
+                stream,
+                initial_config_dir.clone(),
+                session_manager.clone(),
+                authenticator,
+            )
+            .await?;
             return Ok(());
         }
     }
@@ -430,7 +414,13 @@ async fn handle_client(
         // Use accept_async for WebSocket - it will handle the handshake
         match tokio_tungstenite::accept_async(stream).await {
             Ok(ws_stream) => {
-                handle_websocket_connection(ws_stream, initial_config_dir, session_manager, authenticator).await?;
+                handle_websocket_connection(
+                    ws_stream,
+                    initial_config_dir,
+                    session_manager,
+                    authenticator,
+                )
+                .await?;
             }
             Err(e) => {
                 error!("WebSocket handshake failed: {}", e);
@@ -440,638 +430,6 @@ async fn handle_client(
         // Handle as regular HTTP
         handle_http_connection(stream, initial_config_dir, session_manager, authenticator).await?;
     }
-
-    Ok(())
-}
-
-/// Parse multipart/form-data and extract file
-fn parse_multipart_upload(
-    body: &[u8],
-    boundary: &str,
-) -> Result<(String, Vec<u8>), Box<dyn std::error::Error>> {
-    let boundary_str = format!("--{}", boundary);
-    let boundary_bytes = boundary_str.as_bytes();
-
-    let mut start = 0;
-
-    // Find each part
-    let mut filename = String::new();
-    let mut file_data = Vec::new();
-
-    while start < body.len() {
-        // Find boundary
-        let boundary_pos = body[start..]
-            .windows(boundary_bytes.len())
-            .position(|w| w == boundary_bytes);
-
-        let boundary_pos = match boundary_pos {
-            Some(pos) => pos + start,
-            None => break,
-        };
-
-        // Check if this is the end boundary
-        let end_marker_start = boundary_pos + boundary_bytes.len();
-        if end_marker_start + 2 <= body.len()
-            && &body[end_marker_start..end_marker_start + 2] == b"--"
-        {
-            break;
-        }
-
-        // Find end of headers (double newline)
-        let headers_end = body[boundary_pos + boundary_bytes.len() + 2..]
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n");
-
-        let headers_end = match headers_end {
-            Some(pos) => pos + boundary_pos + boundary_bytes.len() + 2,
-            None => break,
-        };
-
-        // Parse headers to find filename (only headers are text, data is binary)
-        let headers_section =
-            String::from_utf8_lossy(&body[boundary_pos + boundary_bytes.len() + 2..headers_end]);
-        let data_start = headers_end + 4;
-
-        // Extract filename from Content-Disposition header
-        for line in headers_section.lines() {
-            if line.contains("filename=") {
-                let start = line.find("filename=\"").unwrap() + 10;
-                let end = line[start..].find('"').unwrap();
-                filename = line[start..start + end].to_string();
-                // Normalize path separators to forward slash
-                filename = filename.replace('\\', "/");
-                break;
-            }
-        }
-
-        // Find next boundary
-        let next_boundary = body[data_start..]
-            .windows(boundary_bytes.len())
-            .position(|w| w == boundary_bytes);
-
-        let data_end = match next_boundary {
-            Some(pos) => pos + data_start - 2, // -2 for \r\n before boundary
-            None => body.len(),
-        };
-
-        if !filename.is_empty() {
-            // Copy raw bytes for binary data
-            file_data = body[data_start..data_end].to_vec();
-            break;
-        }
-
-        start = boundary_pos + 1;
-    }
-
-    if filename.is_empty() {
-        return Err("No file found in upload".into());
-    }
-
-    Ok((filename, file_data))
-}
-
-/// Handle file upload request
-async fn handle_file_upload(
-    content_type: &str,
-    body: &[u8],
-    current_dir: &std::path::PathBuf,
-) -> Result<String, Box<dyn std::error::Error>> {
-    // Extract boundary from Content-Type
-    let boundary = content_type
-        .strip_prefix("multipart/form-data; boundary=")
-        .ok_or("Invalid content type")?;
-
-    let (filename, file_data) = parse_multipart_upload(body, boundary)?;
-
-    let file_path = current_dir.join(&filename);
-
-    // Create parent directories if they don't exist
-    if let Some(parent) = file_path.parent() {
-        if !parent.exists() {
-            fs::create_dir_all(parent)?;
-        }
-    }
-
-    // Write file to disk (binary mode)
-    let mut file = File::create(&file_path)?;
-    file.write_all(&file_data)?;
-    file.flush()?;
-
-    info!(
-        "File uploaded: {} ({} bytes)",
-        file_path.display(),
-        file_data.len()
-    );
-
-    Ok(format!("File uploaded: {}", file_path.display()))
-}
-
-/// Handle file download request
-async fn handle_file_download(
-    query: &str,
-    current_dir: &std::path::PathBuf,
-) -> Result<(Vec<u8>, String), Box<dyn std::error::Error>> {
-    // Parse query parameter: ?path=/filename or ?path=relative/path/file.txt or ?path=file.txt&session_id=xxx
-    let path_param = query
-        .strip_prefix("?")
-        .unwrap_or(query)
-        .split('&')
-        .find_map(|p| {
-            let p = p.trim_start_matches("path=");
-            if p.contains('=') {
-                None
-            } else {
-                Some(p)
-            }
-        })
-        .unwrap_or("");
-
-    if path_param.is_empty() {
-        return Err("No file path specified".into());
-    }
-
-    // Decode URL encoding
-    let decoded_path = url_decoding(path_param);
-
-    // If path is absolute, use it directly; otherwise, join with current directory
-    let file_path = if decoded_path.starts_with('/') {
-        PathBuf::from(&decoded_path)
-    } else {
-        current_dir.join(&decoded_path)
-    };
-
-    if !file_path.exists() {
-        return Err(format!("File not found: {}", file_path.display()).into());
-    }
-
-    // Check if it's a directory - if so, create a zip file
-    if file_path.is_dir() {
-        info!("Zipping directory: {}", file_path.display());
-        let zip_data = create_zip_from_directory(&file_path)?;
-
-        let dir_name = file_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("archive");
-
-        let filename = format!("{}.zip", dir_name);
-
-        // Determine content type for zip
-        let content_type = "application/zip".to_string();
-
-        info!(
-            "Directory zipped: {} -> {} ({} bytes)",
-            file_path.display(),
-            filename,
-            zip_data.len()
-        );
-
-        // Return zip with special filename header
-        return Ok((zip_data, content_type));
-    }
-
-    // Read file content
-    let file_data = fs::read(&file_path)?;
-
-    // Determine content type
-    let content_type = mime_guess::from_path(&file_path)
-        .first_or_octet_stream()
-        .to_string();
-
-    info!(
-        "File downloaded: {} ({} bytes)",
-        file_path.display(),
-        file_data.len()
-    );
-
-    Ok((file_data, content_type))
-}
-
-/// Simple URL decoding (percent decoding)
-fn url_decoding(input: &str) -> String {
-    let mut result = String::new();
-    let mut chars = input.chars();
-
-    while let Some(c) = chars.next() {
-        if c == '%' {
-            let hex1 = chars.next();
-            let hex2 = chars.next();
-
-            if let (Some(h1), Some(h2)) = (hex1, hex2) {
-                if let (Some(d1), Some(d2)) = (h1.to_digit(16), h2.to_digit(16)) {
-                    let byte = (d1 * 16 + d2) as u8;
-                    result.push(byte as char);
-                } else {
-                    result.push(c);
-                    result.push(h1);
-                    result.push(h2);
-                }
-            } else {
-                result.push(c);
-            }
-        } else if c == '+' {
-            result.push(' ');
-        } else {
-            result.push(c);
-        }
-    }
-
-    result
-}
-
-/// List files in a directory
-async fn handle_list_directory(
-    query: &str,
-    current_dir: &std::path::PathBuf,
-) -> Result<DirectoryListing, Box<dyn std::error::Error>> {
-    // Parse query parameter: ?path=/folder or ?path=relative/path or ?path=.&session_id=xxx
-    let path_param = query
-        .strip_prefix("?")
-        .unwrap_or(query)
-        .split('&')
-        .find_map(|p| {
-            let p = p.trim_start_matches("path=");
-            if p.contains('=') {
-                None
-            } else {
-                Some(p)
-            }
-        })
-        .unwrap_or("");
-
-    let target_path = if path_param.is_empty() || path_param == "." {
-        current_dir.clone()
-    } else {
-        let decoded_path = url_decoding(path_param);
-        if decoded_path.starts_with('/') {
-            PathBuf::from(&decoded_path)
-        } else {
-            current_dir.join(&decoded_path)
-        }
-    };
-
-    if !target_path.exists() {
-        return Err("Directory not found".into());
-    }
-
-    let mut files = Vec::new();
-
-    if target_path.is_dir() {
-        // List directory contents
-        let entries = fs::read_dir(&target_path)?;
-        for entry in entries {
-            let entry = entry?;
-            let metadata = entry.metadata().ok();
-            let name = entry.file_name().to_string_lossy().to_string();
-            let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-            let size = if !is_dir {
-                metadata.as_ref().map(|m| m.len())
-            } else {
-                None
-            };
-            let modified = metadata.as_ref().and_then(|m| m.modified().ok()).map(|t| {
-                t.duration_since(std::time::SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-            });
-
-            // Skip hidden files
-            if !name.starts_with('.') {
-                files.push(FileInfo {
-                    path: entry.path().to_string_lossy().to_string(),
-                    name,
-                    is_dir,
-                    size,
-                    modified,
-                });
-            }
-        }
-    }
-
-    // Sort: directories first, then files
-    files.sort_by(|a, b| {
-        if a.is_dir && !b.is_dir {
-            return std::cmp::Ordering::Less;
-        } else if !a.is_dir && b.is_dir {
-            return std::cmp::Ordering::Greater;
-        }
-        a.name.cmp(&b.name)
-    });
-
-    Ok(DirectoryListing {
-        current_path: target_path.to_string_lossy().to_string(),
-        files,
-    })
-}
-
-/// Create a zip file from a directory
-fn create_zip_from_directory(dir_path: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let mut buffer = Vec::new();
-    let mut zip = ZipWriter::new(Cursor::new(&mut buffer));
-
-    let dir_name = dir_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("archive");
-
-    fn add_to_zip(
-        zip: &mut ZipWriter<Cursor<&mut Vec<u8>>>,
-        dir: &Path,
-        base: &Path,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let options: FileOptions<'_, ()> = FileOptions::default();
-
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            let name = path.strip_prefix(base)?.to_string_lossy().to_string();
-
-            if path.is_dir() {
-                zip.add_directory(name.clone(), options)?;
-                add_to_zip(zip, &path, base)?;
-            } else {
-                zip.start_file(name, options)?;
-                let mut file = File::open(&path)?;
-                let mut file_buffer = Vec::new();
-                file.read_to_end(&mut file_buffer)?;
-                zip.write_all(&file_buffer)?;
-            }
-        }
-        Ok(())
-    }
-
-    let base = dir_path.parent().unwrap_or_else(|| Path::new("."));
-    add_to_zip(&mut zip, dir_path, base)?;
-    zip.finish()?;
-
-    Ok(buffer)
-}
-
-/// Extract session_id from query string
-fn extract_session_id_from_query(query: &str) -> Option<String> {
-    query.split('&')
-        .find_map(|p| {
-            let p = p.trim_start_matches('?');
-            if p.starts_with("session_id=") {
-                Some(p["session_id=".len()..].to_string())
-            } else {
-                None
-            }
-        })
-}
-
-/// Handle plain HTTP connection
-async fn handle_http_connection(
-    mut stream: TcpStream,
-    initial_config_dir: PathBuf,
-    session_manager: SessionManager,
-    _authenticator: Arc<Box<dyn Authenticator>>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Read HTTP headers first
-    let mut header_buffer = vec![0u8; 8192];
-    let total_read;
-    let header_end;
-
-    // Read until we find the end of headers (\r\n\r\n)
-    let mut bytes_read = 0;
-    loop {
-        let n = stream.read(&mut header_buffer[bytes_read..]).await?;
-        if n == 0 {
-            return Ok(());
-        }
-        bytes_read += n;
-
-        // Look for end of headers marker
-        if let Some(pos) = header_buffer[..bytes_read]
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-        {
-            total_read = bytes_read;
-            header_end = pos + 4;
-            break;
-        }
-
-        if bytes_read >= header_buffer.len() {
-            return Err("Headers too large".into());
-        }
-    }
-
-    let header_data = String::from_utf8_lossy(&header_buffer[..header_end]);
-    let request_lines: Vec<&str> = header_data.lines().collect();
-
-    if request_lines.is_empty() {
-        return Ok(());
-    }
-
-    let first_line = request_lines[0];
-    let parts: Vec<&str> = first_line.split_whitespace().collect();
-
-    if parts.len() < 2 {
-        return Ok(());
-    }
-
-    let method = parts[0];
-    let full_path = parts[1];
-
-    // Split path and query string
-    let (path, query) = if let Some(pos) = full_path.find('?') {
-        (&full_path[..pos], Some(&full_path[pos..]))
-    } else {
-        (full_path, None)
-    };
-
-    let (status, content_type, body) = if method == "GET" && path == "/download" {
-        // Handle file download
-        let query_str = query.unwrap_or("?path=");
-
-        // Extract session_id from query parameters or use default directory
-        let session_id = extract_session_id_from_query(query_str);
-        let dir = if let Some(sid) = session_id {
-            let sessions = session_manager.read().await;
-            sessions.get(&sid).map(|d| d.clone())
-        } else {
-            None
-        };
-
-        // Use session directory or fall back to initial config directory
-        let dir = if let Some(d) = dir {
-            d.lock().await.clone()
-        } else {
-            initial_config_dir.clone()
-        };
-
-        // Process the download before any await
-        let download_result = handle_file_download(query_str, &dir).await;
-
-        // Extract file data and content type before any await
-        let result = download_result.map_err(|e| e.to_string());
-
-        match result {
-            Ok((file_data, content_type_header)) => {
-                // Extract filename from path for Content-Disposition header
-                // Parse query parameter to extract only the path part (ignore session_id)
-                let path_param = query_str
-                    .strip_prefix("?")
-                    .unwrap_or(query_str)
-                    .split('&')
-                    .find_map(|p| {
-                        let p = p.trim_start_matches("path=");
-                        if p.contains('=') {
-                            None
-                        } else {
-                            Some(p)
-                        }
-                    })
-                    .unwrap_or("download");
-
-                // Decode URL encoding first, then extract filename
-                let decoded_path = url_decoding(path_param);
-                let filename = decoded_path.split('/').last().unwrap_or("download");
-
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nContent-Disposition: attachment; filename=\"{}\"\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
-                    content_type_header,
-                    file_data.len(),
-                    filename
-                );
-
-                stream.write_all(response.as_bytes()).await?;
-                stream.write_all(&file_data).await?;
-                stream.flush().await?;
-                return Ok(());
-            }
-            Err(e) => {
-                let error_msg = format!("Download failed: {}", e);
-                ("404 Not Found", "text/plain", error_msg)
-            }
-        }
-    } else if method == "GET" && path == "/ls" {
-        // Handle directory listing
-        let query_str = query.unwrap_or("?path=.");
-        let session_id = extract_session_id_from_query(query_str);
-        debug!("LS request: query={}, session_id={:?}", query_str, session_id);
-
-        let dir = if let Some(sid) = session_id {
-            let sessions = session_manager.read().await;
-            sessions.get(&sid).map(|d| d.clone())
-        } else {
-            debug!("No session_id found, using initial_config_dir");
-            None
-        };
-
-        let dir = if let Some(d) = dir {
-            let d = d.lock().await.clone();
-            debug!("Using session directory: {}", d.display());
-            d
-        } else {
-            debug!("Using initial config directory: {}", initial_config_dir.display());
-            initial_config_dir.clone()
-        };
-
-        let list_result = handle_list_directory(query_str, &dir).await;
-
-        match list_result {
-            Ok(listing) => {
-                let json_body = serde_json::to_string(&listing)?;
-                ("200 OK", "application/json", json_body)
-            }
-            Err(e) => {
-                let error_msg = format!("List failed: {}", e);
-                (
-                    "500 Internal Server Error",
-                    "application/json",
-                    format!(r#"{{"error":"{}"}}"#, error_msg),
-                )
-            }
-        }
-    } else if method == "POST" && path == "/upload" {
-        // Extract Content-Length
-        let content_length = request_lines
-            .iter()
-            .find(|line| line.to_lowercase().starts_with("content-length:"))
-            .and_then(|line| line.split(':').nth(1))
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .unwrap_or(0);
-
-        if content_length > MAX_UPLOAD_SIZE {
-            (
-                "413 Payload Too Large",
-                "text/plain",
-                format!(
-                    "File too large. Maximum size: {} MB",
-                    MAX_UPLOAD_SIZE / 1024 / 1024
-                ),
-            )
-        } else {
-            // Calculate body size already read
-            let body_already_read = total_read - header_end;
-
-            // Allocate buffer for entire request
-            let mut request_buffer = vec![0u8; header_end + content_length];
-            request_buffer[..header_end].copy_from_slice(&header_buffer[..header_end]);
-
-            // Copy body data already read
-            request_buffer[header_end..header_end + body_already_read]
-                .copy_from_slice(&header_buffer[header_end..total_read]);
-
-            // Read remaining body data
-            if body_already_read < content_length {
-                stream
-                    .read_exact(&mut request_buffer[header_end + body_already_read..])
-                    .await?;
-            }
-
-            let content_type_header = request_lines
-                .iter()
-                .find(|line| line.to_lowercase().starts_with("content-type:"))
-                .and_then(|line| line.split(':').nth(1))
-                .map(|s| s.trim())
-                .unwrap_or("");
-
-            // Extract session_id from headers or query parameters
-            let session_id = request_lines
-                .iter()
-                .find(|line| line.to_lowercase().starts_with("x-session-id:"))
-                .and_then(|line| line.split(':').nth(1))
-                .map(|s| s.trim().to_string())
-                .or_else(|| extract_session_id_from_query(query.unwrap_or("?path=")));
-
-            let dir = if let Some(sid) = session_id {
-                let sessions = session_manager.read().await;
-                sessions.get(&sid).map(|d| d.clone())
-            } else {
-                None
-            };
-            let dir = if let Some(d) = dir {
-                d.lock().await.clone()
-            } else {
-                initial_config_dir.clone()
-            };
-            match handle_file_upload(content_type_header, &request_buffer, &dir).await {
-                Ok(msg) => ("200 OK", "text/plain", msg),
-                Err(e) => (
-                    "400 Bad Request",
-                    "text/plain",
-                    format!("Upload failed: {}", e),
-                ),
-            }
-        }
-    } else if path == "/" || path == "/index.html" {
-        ("200 OK", "text/html", get_html_content())
-    } else {
-        ("404 Not Found", "text/plain", "Not Found".to_string())
-    };
-
-    let response = format!(
-        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
-        status,
-        content_type,
-        body.len(),
-        body
-    );
-
-    stream.write_all(response.as_bytes()).await?;
-    stream.flush().await?;
 
     Ok(())
 }
@@ -1140,7 +498,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let session_manager_clone = session_manager.clone();
         let authenticator_clone = authenticator.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_client(stream, initial_dir_clone, session_manager_clone, authenticator_clone).await {
+            if let Err(e) = handle_client(
+                stream,
+                initial_dir_clone,
+                session_manager_clone,
+                authenticator_clone,
+            )
+            .await
+            {
                 error!("Error handling client: {}", e);
             }
         });
