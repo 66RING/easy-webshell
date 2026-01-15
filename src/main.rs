@@ -33,6 +33,7 @@ mod auth;
 const MAX_UPLOAD_SIZE: usize = 100 * 1024 * 1024; // 100MB max file size
 
 // Session manager to track multiple WebSocket sessions
+// TODO: a wrapper class
 type SessionManager = Arc<RwLock<HashMap<String, Arc<Mutex<PathBuf>>>>>;
 /// File information for directory listing
 #[derive(Debug, Serialize, Deserialize)]
@@ -76,6 +77,7 @@ struct PtySession {
 
 impl PtySession {
     /// Create a new PTY session with specified size and initial directory
+    /// TODO: review
     fn with_size_and_dir(
         cols: u16,
         rows: u16,
@@ -198,6 +200,10 @@ fn get_html_content() -> String {
 }
 
 /// Handle WebSocket connection
+/// 3 worker
+/// 1. forward pty to websocket
+/// 2. forward websocket to pty
+/// 3. periodically sync current directory
 async fn handle_websocket_connection(
     ws_stream: WebSocketStream<TcpStream>,
     initial_config_dir: PathBuf,
@@ -216,9 +222,13 @@ async fn handle_websocket_connection(
             .unwrap()
             .as_micros());
 
+    // TODO: review为什么sink是sender， stream是receiver
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
     // Create session-local current directory (not shared with other connections)
+    // TODO: review. initial_config_dir.clone is useless?
+    // 为什么需要session dir?
+    // session dir从initial_config_dir中初始化 => clone出一个新的
     let session_current_dir = Arc::new(Mutex::new(initial_config_dir.clone()));
 
     // Register session
@@ -229,26 +239,32 @@ async fn handle_websocket_connection(
 
     let initial_dir = Some(initial_config_dir.clone());
 
+    // Create a new pty session
     let pty_session = Arc::new(Mutex::new(PtySession::with_size_and_dir(
         80,
         24,
         initial_dir.as_ref(),
     )?));
+    // TODO: review why clone?
     let pty_session_clone = pty_session.clone();
     let session_dir_clone = session_current_dir.clone();
 
     // Create channel for control messages (auth responses, etc.)
+    // TODO: review usage
     let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<String>(32);
 
     // Authentication state - shared between tasks
     let auth_enabled = !matches!(authenticator.method(), AuthMethod::None);
 
     // Clone session_id for use in first task
+    // TODO: reivew why clone?
     let session_id_for_first_task = session_id.clone();
 
     // Task 1: Forward PTY output to WebSocket
     let pty_to_ws_task = tokio::spawn(async move {
         // Send session_id immediately after connection
+        // TODO: 登录后再send?
+        // 这里发送信号给前端: 需要认证还是不需要
         let session_msg = if auth_enabled {
             serde_json::json!({"auth": "required", "session_id": session_id_for_first_task}).to_string()
         } else {
@@ -261,6 +277,9 @@ async fn handle_websocket_connection(
         }
         info!("Sent session_id {} to client", session_id_for_first_task);
 
+        // periodically forward data to frontend
+        // 1. forward pty data
+        // 2. TODO: review
         let mut interval = interval(Duration::from_millis(10));
         loop {
             interval.tick().await;
@@ -278,6 +297,7 @@ async fn handle_websocket_connection(
             }
 
             // Check for control messages
+            // TODO: review这里接收到的是什么
             if let Ok(msg) = ctrl_rx.try_recv() {
                 if ws_sender.send(Message::Text(msg)).await.is_err() {
                     break;
@@ -287,14 +307,20 @@ async fn handle_websocket_connection(
     });
 
     // Task 2: Forward WebSocket input to PTY
+    // clone a new Arc to do |async move|
     let pty_session_for_sync = pty_session_clone.clone();
-    let pty_session_for_sync2 = pty_session_clone.clone();
-    let session_dir_for_ws = session_dir_clone.clone();
     let session_id_for_ws = session_id.clone();
     let ws_to_pty_task = tokio::spawn(async move {
         let mut authenticated = !auth_enabled;
-        let mut last_cmd = String::new();
 
+        // TODO: review receiver是什么时候触发的? (在前端)
+        // loop:
+        // 1. receive control command TODO: review
+        //  - authenticator
+        //  - pty input data (user input)
+        //  - pty control data (resize, ...)
+        // 2. receive pty binary data and update pty
+        // 3. close
         while let Some(result) = ws_receiver.next().await {
             match result {
                 Ok(Message::Text(text)) => {
@@ -338,7 +364,11 @@ async fn handle_websocket_connection(
                     }
 
                     // Check if it's a resize message (JSON)
+                    // TODO: 还有更好的方式处理不同类型的指令吗
+                    // 这里是强制尝试序列化
+                    // 所有指令都通过json格式传递?
                     if text.starts_with('{') {
+                        // TODO: 如果以后还有resize以为的控制指令, 这里应该怎么设计?
                         if let Ok(msg) = serde_json::from_str::<ResizeMessage>(&text) {
                             debug!("Terminal resized to {}x{}", msg.cols, msg.rows);
                             let mut session = pty_session_clone.lock().await;
@@ -353,36 +383,9 @@ async fn handle_websocket_connection(
                         // Regular input to PTY
                         debug!("WS -> PTY: {} bytes", text.len());
                         let mut session = pty_session_clone.lock().await;
+                        // TODO: review binary和text都是write
+                        // pty session是有什么协议来识别这里数据类型吗?
                         session.write(text.as_bytes());
-
-                        // Track commands to detect cd
-                        if text == "\r" || text == "\n" {
-                            // Check if last command was 'cd'
-                            let cmd = last_cmd.trim().to_string();
-                            if cmd.starts_with("cd ") || cmd == "cd" {
-                                // Sync current directory after cd command
-                                let pty = pty_session_for_sync.clone();
-                                let dir = session_dir_for_ws.clone();
-                                tokio::spawn(async move {
-                                    // Wait a bit for cd to complete
-                                    tokio::time::sleep(Duration::from_millis(100)).await;
-                                    sync_current_directory(pty, dir).await;
-                                });
-                            }
-                            last_cmd.clear();
-                        } else if text == "\u{7f}" || text == "\x08" {
-                            // Backspace
-                            last_cmd.pop();
-                        } else if text.len() == 1
-                            && text
-                                .chars()
-                                .next()
-                                .map(|c| c.is_ascii_graphic())
-                                .unwrap_or(false)
-                        {
-                            // Regular character
-                            last_cmd.push(text.chars().next().unwrap());
-                        }
                     }
                 }
                 Ok(Message::Binary(data)) => {
@@ -410,10 +413,10 @@ async fn handle_websocket_connection(
     let dir_sync_task = tokio::spawn(async move {
         let mut sync_interval = interval(Duration::from_secs(2));
         // Initial sync
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
         loop {
             sync_interval.tick().await;
-            sync_current_directory(pty_session_for_sync2.clone(), session_dir_for_sync.clone()).await;
+            sync_current_directory(pty_session_for_sync.clone(), session_dir_for_sync.clone()).await;
         }
     });
 
@@ -474,6 +477,14 @@ async fn sync_current_directory(
 }
 
 /// Find the shell's current working directory by PTY device
+/// by looking at /proc/[pid]/fd/0 (stdin) or /proc/[pid]/fd/1 (stdout)
+/// if the fd_id was link to the target pts device. the process found.
+///
+/// Linux fs tips: every thing is a file.
+/// process state: /proc/[pid]
+///     opened file: /proc/[pid]/fd (a link to target file/device)
+///     cwd: /proc/[pid]/cwd (a link)
+///     ...
 fn find_shell_cwd(pts_name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let proc_path = PathBuf::from("/proc");
 
@@ -495,6 +506,7 @@ fn find_shell_cwd(pts_name: &str) -> Result<PathBuf, Box<dyn std::error::Error>>
             }
 
             // Check if this process has the PTY as its stdin/stdout/stderr
+            // TODO: 新增一些pty的debug信息, 比如pts name
             let fds_path = entry.path().join("fd");
             if let Ok(fds) = fs::read_dir(&fds_path) {
                 for fd_entry in fds.filter_map(|e| e.ok()) {
@@ -521,6 +533,7 @@ fn find_shell_cwd(pts_name: &str) -> Result<PathBuf, Box<dyn std::error::Error>>
 }
 
 /// Handle client connection
+///     handle ws or http
 async fn handle_client(
     stream: TcpStream,
     initial_config_dir: PathBuf,
@@ -529,16 +542,22 @@ async fn handle_client(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Peek at the first bytes to determine the request type without consuming them
     let mut peek_buffer = [0u8; 512];
+    // TODO: review why need a peek?
     match stream.peek(&mut peek_buffer).await {
         Ok(0) => return Ok(()),
         Ok(_) => {}
         Err(_) => {
             // Connection might be closed, try HTTP anyway
+            // TODO: review why?
+            // also as a http server?
             handle_http_connection(stream, initial_config_dir.clone(), session_manager.clone(), authenticator).await?;
             return Ok(());
         }
     }
 
+    // TODO: review websocket的固定格式吗
+    // 描述以下这个协议?
+    // 为什么是upgrade: 和websocket字符串
     let request_peek = String::from_utf8_lossy(&peek_buffer).to_lowercase();
 
     // Check if it's a WebSocket upgrade request
@@ -1244,6 +1263,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wrap authenticator in Arc for sharing across connections
     let authenticator = Arc::new(authenticator);
 
+    // main loop
+    // 1. create tcp connection
+    // 2. create a new session state
+    // 3. start session worker
     loop {
         let (stream, addr) = listener.accept().await?;
         info!("New connection from {}", addr);
