@@ -9,14 +9,9 @@ pub type SessionManager = Arc<RwLock<HashMap<String, Arc<Mutex<PathBuf>>>>>;
 
 /// Extract session_id from query string
 pub fn extract_session_id_from_query(query: &str) -> Option<String> {
-    query.split('&')
-        .find_map(|p| {
-            let p = p.trim_start_matches('?');
-            if p.starts_with("session_id=") {
-                Some(p["session_id=".len()..].to_string())
-            } else {
-                None
-            }
-        })
+    query.split('&').find_map(|p| {
+        let p = p.trim_start_matches('?');
+        p.strip_prefix("session_id=")
+            .map(|session_id| session_id.to_string())
+    })
 }
-

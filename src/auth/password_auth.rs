@@ -9,10 +9,7 @@ pub struct PasswordAuthenticator {
 impl Authenticator for PasswordAuthenticator {
     fn authenticate(&self, credentials: &Credentials) -> bool {
         credentials.username == self.username
-            && credentials
-                .password
-                .as_ref()
-                .map_or(false, |p| p == &self.password)
+            && (credentials.password.as_ref() == Some(&self.password))
     }
 
     fn method(&self) -> AuthMethod {

@@ -50,7 +50,7 @@ impl PtySession {
             // Spawn shell
             let _ = Command::new(&shell).exec();
             // If exec returns, there was an error
-            Err(std::io::Error::new(std::io::ErrorKind::Other, "Failed to exec shell").into())
+            Err(std::io::Error::other("Failed to exec shell").into())
         } else {
             // Parent process
             let master = fork.is_parent()?;
@@ -66,7 +66,7 @@ impl PtySession {
 
             let mut session = PtySession {
                 _fork: fork,
-                master: Some(master.clone()),
+                master: Some(master),
                 pts_name,
             };
 
@@ -98,7 +98,7 @@ impl PtySession {
             };
 
             unsafe {
-                if ioctl(master.as_raw_fd(), TIOCSWINSZ as u64, &winsize) < 0 {
+                if ioctl(master.as_raw_fd(), TIOCSWINSZ, &winsize) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
             }
@@ -211,7 +211,7 @@ fn find_shell_cwd(pts_name: &str) -> Result<PathBuf, Box<dyn std::error::Error>>
             let fds_path = entry.path().join("fd");
             if let Ok(fds) = fs::read_dir(&fds_path) {
                 for fd_entry in fds.filter_map(|e| e.ok()) {
-                    if let Ok(target) = fs::read_link(&fd_entry.path()) {
+                    if let Ok(target) = fs::read_link(fd_entry.path()) {
                         let target_str = target.to_string_lossy();
                         // Check if this fd points to our PTY
                         if target_str.contains(pts_name) || target_str == pts_name {

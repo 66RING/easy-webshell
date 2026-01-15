@@ -2,7 +2,7 @@ use crate::fs_opt::{FileInfo, create_zip_from_directory, DirectoryListing};
 use log::{error, info};
 use std::fs::{self, File};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{PathBuf, Path};
 
 /// HTML content for the terminal interface
 pub fn get_html_content() -> String {
@@ -48,7 +48,7 @@ pub fn url_decoding(input: &str) -> String {
 /// Handle file download request
 pub async fn handle_file_download(
     query: &str,
-    current_dir: &std::path::PathBuf,
+    current_dir: &Path,
 ) -> Result<(Vec<u8>, String), Box<dyn std::error::Error>> {
     // Parse query parameter: ?path=/filename or ?path=relative/path/file.txt or ?path=file.txt&session_id=xxx
     let path_param = query
@@ -217,7 +217,7 @@ fn parse_multipart_upload(
 pub async fn handle_file_upload(
     content_type: &str,
     body: &[u8],
-    current_dir: &std::path::PathBuf,
+    current_dir: &Path,
 ) -> Result<String, Box<dyn std::error::Error>> {
     // Extract boundary from Content-Type
     let boundary = content_type
@@ -252,7 +252,7 @@ pub async fn handle_file_upload(
 /// List files in a directory
 pub async fn handle_list_directory(
     query: &str,
-    current_dir: &std::path::PathBuf,
+    current_dir: &Path,
 ) -> Result<DirectoryListing, Box<dyn std::error::Error>> {
     // Parse query parameter: ?path=/folder or ?path=relative/path or ?path=.&session_id=xxx
     let path_param = query
@@ -270,7 +270,7 @@ pub async fn handle_list_directory(
         .unwrap_or("");
 
     let target_path = if path_param.is_empty() || path_param == "." {
-        current_dir.clone()
+        current_dir.to_path_buf()
     } else {
         let decoded_path = url_decoding(path_param);
         if decoded_path.starts_with('/') {

@@ -79,7 +79,7 @@ pub async fn handle_http_connection(
         let session_id = extract_session_id_from_query(query_str);
         let dir = if let Some(sid) = session_id {
             let sessions = session_manager.read().await;
-            sessions.get(&sid).map(|d| d.clone())
+            sessions.get(&sid).cloned()
         } else {
             None
         };
@@ -117,7 +117,9 @@ pub async fn handle_http_connection(
 
                 // Decode URL encoding first, then extract filename
                 let decoded_path = url_decoding(path_param);
-                let filename = decoded_path.split('/').last().unwrap_or("download");
+                // use next_back() instead of last()
+                //  since last() will needlessly iterate the entire iterator
+                let filename = decoded_path.split('/').next_back().unwrap_or("download");
 
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nContent-Disposition: attachment; filename=\"{}\"\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
@@ -147,7 +149,7 @@ pub async fn handle_http_connection(
 
         let dir = if let Some(sid) = session_id {
             let sessions = session_manager.read().await;
-            sessions.get(&sid).map(|d| d.clone())
+            sessions.get(&sid).cloned()
         } else {
             debug!("No session_id found, using initial_config_dir");
             None
@@ -235,7 +237,7 @@ pub async fn handle_http_connection(
 
             let dir = if let Some(sid) = session_id {
                 let sessions = session_manager.read().await;
-                sessions.get(&sid).map(|d| d.clone())
+                sessions.get(&sid).cloned()
             } else {
                 None
             };
