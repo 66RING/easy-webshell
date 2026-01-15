@@ -14,7 +14,7 @@ use tokio::sync::{Mutex, RwLock};
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::WebSocketStream;
 
-use crate::app::load_config;
+use crate::config::load_config;
 use crate::auth::create_authenticator;
 use crate::auth::{AuthMethod, Authenticator, Credentials};
 use crate::shell::PtySession;
@@ -22,7 +22,7 @@ use crate::shell::PtySession;
 use zip::write::FileOptions;
 use zip::ZipWriter;
 
-mod app;
+mod config;
 mod auth;
 mod shell;
 

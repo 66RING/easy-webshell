@@ -1,6 +1,6 @@
 use self::none_auth::NoAuthenticator;
 use self::password_auth::PasswordAuthenticator;
-use crate::app::Config;
+use crate::config::Config;
 use log::{error, info};
 use serde::{Deserialize, Serialize};
 
