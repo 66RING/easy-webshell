@@ -1,7 +1,7 @@
 use crate::api::types::FileQuery;
+use crate::api::AuthenticatedSession;
 use crate::fs_opt::{create_zip_from_directory, DirectoryListing, FileInfo};
 use crate::server::AppState;
-use crate::session::is_authenticated;
 use axum::{
     body::Body,
     extract::State,
@@ -21,24 +21,12 @@ pub fn get_html_content() -> String {
 }
 
 /// Helper function to get current directory for a session
-async fn get_current_dir(state: &AppState, session_id: Option<&String>) -> PathBuf {
-    if let Some(sid) = session_id {
-        let sessions = state.sessions.read().await;
-        if let Some(dir) = sessions.get(sid) {
-            return dir.lock().await.clone();
-        }
+async fn get_current_dir(state: &AppState, session_id: &str) -> PathBuf {
+    let sessions = state.sessions.read().await;
+    if let Some(dir) = sessions.get(session_id) {
+        return dir.lock().await.clone();
     }
     state.initial_dir.clone()
-}
-
-/// Helper function to verify session authentication
-async fn verify_session(state: &AppState, session_id: Option<&String>) -> Result<(), String> {
-    let sid = session_id.ok_or("No session ID provided")?;
-    let is_auth = is_authenticated(&state.authenticated_sessions, sid).await;
-    if !is_auth {
-        return Err("Session not authenticated".to_string());
-    }
-    Ok(())
 }
 
 /// Simple URL decoding (percent decoding)
@@ -109,16 +97,12 @@ pub async fn js_handler() -> impl IntoResponse {
 pub async fn download_handler(
     axum::extract::Query(params): axum::extract::Query<FileQuery>,
     State(state): State<AppState>,
+    AuthenticatedSession(session_id): AuthenticatedSession,
 ) -> impl IntoResponse {
     use axum::http::StatusCode;
 
-    // Verify session authentication
-    if let Err(e) = verify_session(&state, params.session_id.as_ref()).await {
-        return (StatusCode::UNAUTHORIZED, e).into_response();
-    }
-
     // Get current directory based on session
-    let current_dir = get_current_dir(&state, params.session_id.as_ref()).await;
+    let current_dir = get_current_dir(&state, &session_id).await;
 
     // Get path from query parameters
     let path_param = match params.path {
@@ -217,19 +201,12 @@ pub async fn download_handler(
 pub async fn list_handler(
     axum::extract::Query(params): axum::extract::Query<FileQuery>,
     State(state): State<AppState>,
+    AuthenticatedSession(session_id): AuthenticatedSession,
 ) -> impl IntoResponse {
     use axum::http::StatusCode;
     use axum::Json;
 
-    // Verify session authentication
-    if let Err(e) = verify_session(&state, params.session_id.as_ref()).await {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": e}))
-        ).into_response();
-    }
-
-    let current_dir = get_current_dir(&state, params.session_id.as_ref()).await;
+    let current_dir = get_current_dir(&state, &session_id).await;
 
     // Get target path
     let target_path = if let Some(ref path) = params.path {
@@ -320,19 +297,15 @@ pub async fn list_handler(
 
 /// Upload handler - handles file uploads
 pub async fn upload_handler(
-    axum::extract::Query(params): axum::extract::Query<FileQuery>,
+    axum::extract::Query(_params): axum::extract::Query<FileQuery>,
     State(state): State<AppState>,
+    AuthenticatedSession(session_id): AuthenticatedSession,
     mut multipart: axum::extract::Multipart,
 ) -> impl IntoResponse {
     use axum::http::StatusCode;
 
-    // Verify session authentication
-    if let Err(e) = verify_session(&state, params.session_id.as_ref()).await {
-        return (StatusCode::UNAUTHORIZED, e).into_response();
-    }
-
     // Get current directory based on session
-    let current_dir = get_current_dir(&state, params.session_id.as_ref()).await;
+    let current_dir = get_current_dir(&state, &session_id).await;
 
     // Process all fields until we find a file
     loop {
