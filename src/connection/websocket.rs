@@ -11,7 +11,7 @@ use axum::extract::ws::{Message, WebSocket};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{AuthMethod, Authenticator, Credentials};
-use crate::session::SessionManager;
+use crate::session::{SessionManager, add_authenticated_session, remove_authenticated_session, AuthenticatedSessions};
 use crate::shell::PtySession;
 use crate::shell::pty::sync_current_directory;
 
@@ -32,6 +32,7 @@ pub async fn handle_websocket_connection(
     socket: WebSocket,
     initial_config_dir: PathBuf,
     session_manager: SessionManager,
+    authenticated_sessions: AuthenticatedSessions,
     authenticator: Arc<Box<dyn Authenticator>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("New WebSocket connection established");
@@ -139,6 +140,7 @@ pub async fn handle_websocket_connection(
     // clone a new Arc to do |async move|
     let pty_session_for_sync = pty_session_clone.clone();
     let session_id_for_ws = session_id.clone();
+    let authenticated_sessions_for_ws = authenticated_sessions.clone();
     let ws_to_pty_task = tokio::spawn(async move {
         let mut authenticated = !auth_enabled;
 
@@ -170,6 +172,8 @@ pub async fn handle_websocket_connection(
 
                                     if authenticator.authenticate(&credentials) {
                                         authenticated = true;
+                                        // Add session to authenticated set
+                                        add_authenticated_session(&authenticated_sessions_for_ws, session_id_for_ws.clone()).await;
                                         let _ = ctrl_tx.send(
                                             serde_json::json!({"auth": "success", "session_id": session_id_for_ws}).to_string()
                                         ).await;
@@ -238,6 +242,7 @@ pub async fn handle_websocket_connection(
     // Task 3: Periodically sync current directory
     let session_dir_for_sync = session_current_dir.clone();
     let session_manager_for_cleanup = session_manager.clone();
+    let authenticated_sessions_for_cleanup = authenticated_sessions.clone();
     let session_id_for_cleanup = session_id.clone();
     let dir_sync_task = tokio::spawn(async move {
         let mut sync_interval = interval(Duration::from_millis(100));
@@ -268,6 +273,8 @@ pub async fn handle_websocket_connection(
         let mut sessions = session_manager_for_cleanup.write().await;
         sessions.remove(&session_id_for_cleanup);
     }
+    // Remove from authenticated sessions
+    remove_authenticated_session(&authenticated_sessions_for_cleanup, &session_id_for_cleanup).await;
     info!(
         "WebSocket connection closed, session {} removed",
         session_id_for_cleanup

@@ -18,12 +18,13 @@ use crate::api::{index_handler, download_handler, list_handler, upload_handler, 
 use crate::auth::create_authenticator;
 use crate::config::Config;
 use crate::connection::websocket::handle_websocket_connection;
-use crate::session::SessionManager;
+use crate::session::{SessionManager, create_authenticated_sessions, AuthenticatedSessions};
 
 /// Application state shared across all handlers
 #[derive(Clone)]
 pub struct AppState {
     pub sessions: SessionManager,
+    pub authenticated_sessions: AuthenticatedSessions,
     pub initial_dir: PathBuf,
     pub authenticator: Arc<Box<dyn crate::auth::Authenticator>>,
 }
@@ -40,6 +41,7 @@ async fn websocket_handler(
             socket,
             state.initial_dir,
             state.sessions,
+            state.authenticated_sessions,
             state.authenticator,
         )
         .await
@@ -62,6 +64,9 @@ pub async fn run_server(config: Config) -> Result<(), Box<dyn std::error::Error>
     // Create session manager
     let sessions: SessionManager = Arc::new(RwLock::new(HashMap::new()));
 
+    // Create authenticated sessions tracker
+    let authenticated_sessions = create_authenticated_sessions();
+
     // Determine initial working directory
     let initial_dir = if let Some(ref custom_dir) = config.server.cur_dir {
         PathBuf::from(custom_dir)
@@ -78,6 +83,7 @@ pub async fn run_server(config: Config) -> Result<(), Box<dyn std::error::Error>
     // Build axum application state
     let app_state = AppState {
         sessions: sessions.clone(),
+        authenticated_sessions: authenticated_sessions.clone(),
         initial_dir: initial_dir.clone(),
         authenticator: authenticator.clone(),
     };

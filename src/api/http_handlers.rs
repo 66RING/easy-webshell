@@ -1,6 +1,7 @@
 use crate::api::types::FileQuery;
 use crate::fs_opt::{create_zip_from_directory, DirectoryListing, FileInfo};
 use crate::server::AppState;
+use crate::session::is_authenticated;
 use axum::{
     body::Body,
     extract::State,
@@ -28,6 +29,16 @@ async fn get_current_dir(state: &AppState, session_id: Option<&String>) -> PathB
         }
     }
     state.initial_dir.clone()
+}
+
+/// Helper function to verify session authentication
+async fn verify_session(state: &AppState, session_id: Option<&String>) -> Result<(), String> {
+    let sid = session_id.ok_or("No session ID provided")?;
+    let is_auth = is_authenticated(&state.authenticated_sessions, sid).await;
+    if !is_auth {
+        return Err("Session not authenticated".to_string());
+    }
+    Ok(())
 }
 
 /// Simple URL decoding (percent decoding)
@@ -100,6 +111,11 @@ pub async fn download_handler(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     use axum::http::StatusCode;
+
+    // Verify session authentication
+    if let Err(e) = verify_session(&state, params.session_id.as_ref()).await {
+        return (StatusCode::UNAUTHORIZED, e).into_response();
+    }
 
     // Get current directory based on session
     let current_dir = get_current_dir(&state, params.session_id.as_ref()).await;
@@ -205,6 +221,14 @@ pub async fn list_handler(
     use axum::http::StatusCode;
     use axum::Json;
 
+    // Verify session authentication
+    if let Err(e) = verify_session(&state, params.session_id.as_ref()).await {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": e}))
+        ).into_response();
+    }
+
     let current_dir = get_current_dir(&state, params.session_id.as_ref()).await;
 
     // Get target path
@@ -301,6 +325,11 @@ pub async fn upload_handler(
     mut multipart: axum::extract::Multipart,
 ) -> impl IntoResponse {
     use axum::http::StatusCode;
+
+    // Verify session authentication
+    if let Err(e) = verify_session(&state, params.session_id.as_ref()).await {
+        return (StatusCode::UNAUTHORIZED, e).into_response();
+    }
 
     // Get current directory based on session
     let current_dir = get_current_dir(&state, params.session_id.as_ref()).await;
