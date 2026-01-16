@@ -154,10 +154,10 @@ pub async fn sync_current_directory(
         session.pts_name.clone()
     };
 
-    if let Some(pts) = pts_name {
+    if let Some(ref pts) = pts_name {
         // Find the process that has this PTY as its controlling terminal
         // by looking at /proc/[pid]/fd/0 (stdin) or /proc/[pid]/fd/1 (stdout)
-        let cwd = find_shell_cwd(&pts);
+        let cwd = find_shell_cwd(pts);
 
         // Handle the result before any await
         let cwd_opt = cwd.ok();
@@ -207,7 +207,6 @@ fn find_shell_cwd(pts_name: &str) -> Result<PathBuf, Box<dyn std::error::Error>>
             }
 
             // Check if this process has the PTY as its stdin/stdout/stderr
-            // TODO: 新增一些pty的debug信息, 比如pts name
             let fds_path = entry.path().join("fd");
             if let Ok(fds) = fs::read_dir(&fds_path) {
                 for fd_entry in fds.filter_map(|e| e.ok()) {
@@ -218,7 +217,7 @@ fn find_shell_cwd(pts_name: &str) -> Result<PathBuf, Box<dyn std::error::Error>>
                             // Found the process! Now get its cwd
                             let cwd_path = entry.path().join("cwd");
                             if let Ok(cwd) = fs::read_link(&cwd_path) {
-                                debug!("Found shell PID {} with cwd: {}", pid, cwd.display());
+                                debug!("Found shell PID {} with PTY {} and cwd: {}", pid, pts_name, cwd.display());
                                 return Ok(cwd);
                             }
                         }
@@ -228,7 +227,5 @@ fn find_shell_cwd(pts_name: &str) -> Result<PathBuf, Box<dyn std::error::Error>>
         }
     }
 
-    // Fallback: return current directory
-    debug!("Could not find shell process, using current directory");
-    Ok(env::current_dir()?)
+    unreachable!();
 }

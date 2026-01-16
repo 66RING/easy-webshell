@@ -270,12 +270,14 @@ pub async fn list_handler(
 
 /// Upload handler - handles file uploads
 pub async fn upload_handler(
+    axum::extract::Query(params): axum::extract::Query<FileQuery>,
     State(state): State<AppState>,
     mut multipart: axum::extract::Multipart,
 ) -> impl IntoResponse {
     use axum::http::StatusCode;
 
-    let current_dir = &state.initial_dir;
+    // Get current directory based on session
+    let current_dir = get_current_dir(&state, params.session_id.as_ref()).await;
 
     // Process all fields until we find a file
     loop {

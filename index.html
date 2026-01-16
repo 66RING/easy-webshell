@@ -735,20 +735,14 @@
             const blob = file instanceof Blob ? file : new Blob([file], { type: file.type || 'application/octet-stream' });
             formData.append('file', blob, path);
 
-            // Prepare headers with session_id
-            const headers = {
-                'X-Upload-Path': path
-            };
-            if (sessionId) {
-                headers['X-Session-Id'] = sessionId;
-            }
+            // Add session_id to URL query parameters
+            const sessionParam = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : '';
 
             for (let attempt = 1; attempt <= maxRetries; attempt++) {
                 try {
-                    const response = await fetch('/upload', {
+                    const response = await fetch(`/upload${sessionParam}`, {
                         method: 'POST',
-                        body: formData,
-                        headers: headers
+                        body: formData
                     });
 
                     if (response.ok) {

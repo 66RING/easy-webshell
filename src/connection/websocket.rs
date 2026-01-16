@@ -71,8 +71,10 @@ pub async fn handle_websocket_connection(
         24,
         initial_dir.as_ref(),
     )?));
-    // TODO: review why clone?
+    // Clone for different tasks
     let pty_session_clone = pty_session.clone();
+    #[allow(unused_variables)]
+    let pty_session_for_sync = pty_session.clone();
 
     // Create channel for control messages (auth responses, etc.)
     // TODO: review usage
@@ -238,9 +240,9 @@ pub async fn handle_websocket_connection(
     let session_manager_for_cleanup = session_manager.clone();
     let session_id_for_cleanup = session_id.clone();
     let dir_sync_task = tokio::spawn(async move {
-        let mut sync_interval = interval(Duration::from_secs(2));
-        // Initial sync
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut sync_interval = interval(Duration::from_millis(100));
+        // First tick completes immediately, so we skip it
+        sync_interval.tick().await;
         loop {
             sync_interval.tick().await;
             sync_current_directory(pty_session_for_sync.clone(), session_dir_for_sync.clone())
