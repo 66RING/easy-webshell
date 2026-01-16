@@ -1,4 +1,11 @@
 use crate::fs_opt::{FileInfo, create_zip_from_directory, DirectoryListing};
+use crate::server::AppState;
+use crate::api::types::FileQuery;
+use axum::{
+    response::{IntoResponse, Response},
+    extract::State,
+    body::Body,
+};
 use log::{error, info};
 use std::fs::{self, File};
 use std::io::Write;
@@ -10,6 +17,17 @@ pub fn get_html_content() -> String {
         error!("Failed to read index.html: {}", e);
         "<html><body><h1>Error loading page</h1></body></html>".to_string()
     })
+}
+
+/// Helper function to get current directory for a session
+async fn get_current_dir(state: &AppState, session_id: Option<&String>) -> PathBuf {
+    if let Some(sid) = session_id {
+        let sessions = state.sessions.read().await;
+        if let Some(dir) = sessions.get(sid) {
+            return dir.lock().await.clone();
+        }
+    }
+    state.initial_dir.clone()
 }
 
 /// Simple URL decoding (percent decoding)
@@ -44,174 +62,6 @@ pub fn url_decoding(input: &str) -> String {
     result
 }
 
-
-/// Handle file download request
-pub async fn handle_file_download(
-    query: &str,
-    current_dir: &Path,
-) -> Result<(Vec<u8>, String), Box<dyn std::error::Error>> {
-    // Parse query parameter: ?path=/filename or ?path=relative/path/file.txt or ?path=file.txt&session_id=xxx
-    let path_param = query
-        .strip_prefix("?")
-        .unwrap_or(query)
-        .split('&')
-        .find_map(|p| {
-            let p = p.trim_start_matches("path=");
-            if p.contains('=') {
-                None
-            } else {
-                Some(p)
-            }
-        })
-        .unwrap_or("");
-
-    if path_param.is_empty() {
-        return Err("No file path specified".into());
-    }
-
-    // Decode URL encoding
-    let decoded_path = url_decoding(path_param);
-
-    // If path is absolute, use it directly; otherwise, join with current directory
-    let file_path = if decoded_path.starts_with('/') {
-        PathBuf::from(&decoded_path)
-    } else {
-        current_dir.join(&decoded_path)
-    };
-
-    if !file_path.exists() {
-        return Err(format!("File not found: {}", file_path.display()).into());
-    }
-
-    // Check if it's a directory - if so, create a zip file
-    if file_path.is_dir() {
-        info!("Zipping directory: {}", file_path.display());
-        let zip_data = create_zip_from_directory(&file_path)?;
-
-        let dir_name = file_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("archive");
-
-        let filename = format!("{}.zip", dir_name);
-
-        // Determine content type for zip
-        let content_type = "application/zip".to_string();
-
-        info!(
-            "Directory zipped: {} -> {} ({} bytes)",
-            file_path.display(),
-            filename,
-            zip_data.len()
-        );
-
-        // Return zip with special filename header
-        return Ok((zip_data, content_type));
-    }
-
-    // Read file content
-    let file_data = fs::read(&file_path)?;
-
-    // Determine content type
-    let content_type = mime_guess::from_path(&file_path)
-        .first_or_octet_stream()
-        .to_string();
-
-    info!(
-        "File downloaded: {} ({} bytes)",
-        file_path.display(),
-        file_data.len()
-    );
-
-    Ok((file_data, content_type))
-}
-
-
-/// Parse multipart/form-data and extract file
-fn parse_multipart_upload(
-    body: &[u8],
-    boundary: &str,
-) -> Result<(String, Vec<u8>), Box<dyn std::error::Error>> {
-    let boundary_str = format!("--{}", boundary);
-    let boundary_bytes = boundary_str.as_bytes();
-
-    let mut start = 0;
-
-    // Find each part
-    let mut filename = String::new();
-    let mut file_data = Vec::new();
-
-    while start < body.len() {
-        // Find boundary
-        let boundary_pos = body[start..]
-            .windows(boundary_bytes.len())
-            .position(|w| w == boundary_bytes);
-
-        let boundary_pos = match boundary_pos {
-            Some(pos) => pos + start,
-            None => break,
-        };
-
-        // Check if this is the end boundary
-        let end_marker_start = boundary_pos + boundary_bytes.len();
-        if end_marker_start + 2 <= body.len()
-            && &body[end_marker_start..end_marker_start + 2] == b"--"
-        {
-            break;
-        }
-
-        // Find end of headers (double newline)
-        let headers_end = body[boundary_pos + boundary_bytes.len() + 2..]
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n");
-
-        let headers_end = match headers_end {
-            Some(pos) => pos + boundary_pos + boundary_bytes.len() + 2,
-            None => break,
-        };
-
-        // Parse headers to find filename (only headers are text, data is binary)
-        let headers_section =
-            String::from_utf8_lossy(&body[boundary_pos + boundary_bytes.len() + 2..headers_end]);
-        let data_start = headers_end + 4;
-
-        // Extract filename from Content-Disposition header
-        for line in headers_section.lines() {
-            if line.contains("filename=") {
-                let start = line.find("filename=\"").unwrap() + 10;
-                let end = line[start..].find('"').unwrap();
-                filename = line[start..start + end].to_string();
-                // Normalize path separators to forward slash
-                filename = filename.replace('\\', "/");
-                break;
-            }
-        }
-
-        // Find next boundary
-        let next_boundary = body[data_start..]
-            .windows(boundary_bytes.len())
-            .position(|w| w == boundary_bytes);
-
-        let data_end = match next_boundary {
-            Some(pos) => pos + data_start - 2, // -2 for \r\n before boundary
-            None => body.len(),
-        };
-
-        if !filename.is_empty() {
-            // Copy raw bytes for binary data
-            file_data = body[data_start..data_end].to_vec();
-            break;
-        }
-
-        start = boundary_pos + 1;
-    }
-
-    if filename.is_empty() {
-        return Err("No file found in upload".into());
-    }
-
-    Ok((filename, file_data))
-}
 
 /// Handle file upload request
 pub async fn handle_file_upload(
@@ -333,3 +183,263 @@ pub async fn handle_list_directory(
         files,
     })
 }
+
+/////////////// TODO: review
+
+/// Index handler - serves the HTML page
+pub async fn index_handler() -> impl IntoResponse {
+    let html = get_html_content();
+    axum::response::Html(html)
+}
+
+
+/// Download handler - serves file downloads
+pub async fn download_handler(
+    axum::extract::Query(params): axum::extract::Query<FileQuery>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    use axum::http::StatusCode;
+
+    // Get current directory based on session
+    let current_dir = get_current_dir(&state, params.session_id.as_ref()).await;
+
+    // Get path from query parameters
+    let path_param = match params.path {
+        Some(ref p) if !p.is_empty() => p.clone(),
+        _ => return (StatusCode::BAD_REQUEST, "No file path specified").into_response(),
+    };
+
+    // URL decode the path
+    let decoded_path = url_decoding(&path_param);
+
+    // Build full file path
+    let file_path = if decoded_path.starts_with('/') {
+        PathBuf::from(&decoded_path)
+    } else {
+        current_dir.join(&decoded_path)
+    };
+
+    // Check if file exists
+    if !file_path.exists() {
+        return (StatusCode::NOT_FOUND, format!("File not found: {}", file_path.display())).into_response();
+    }
+
+    // Handle directory - create zip
+    if file_path.is_dir() {
+        info!("Zipping directory: {}", file_path.display());
+        match create_zip_from_directory(&file_path) {
+            Ok(zip_data) => {
+                let dir_name = file_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("archive");
+                let filename = format!("{}.zip", dir_name);
+
+                let response = Response::builder()
+                    .status(200)
+                    .header("content-type", "application/zip")
+                    .header("content-disposition", format!("attachment; filename=\"{}\"", filename))
+                    .header("content-length", zip_data.len())
+                    .header("access-control-allow-origin", "*")
+                    .body(Body::from(zip_data))
+                    .unwrap();
+                return response.into_response();
+            }
+            Err(e) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            }
+        }
+    }
+
+    // Read regular file
+    match fs::read(&file_path) {
+        Ok(file_data) => {
+            let content_type = mime_guess::from_path(&file_path)
+                .first_or_octet_stream()
+                .to_string();
+
+            let filename = params.filename.unwrap_or_else(|| {
+                file_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("download")
+                    .to_string()
+            });
+
+            info!("File downloaded: {} ({} bytes)", file_path.display(), file_data.len());
+
+            let response = Response::builder()
+                .status(200)
+                .header("content-type", content_type)
+                .header("content-disposition", format!("attachment; filename=\"{}\"", filename))
+                .header("content-length", file_data.len())
+                .header("access-control-allow-origin", "*")
+                .body(Body::from(file_data))
+                .unwrap();
+            response.into_response()
+        }
+        Err(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
+
+/// List handler - lists directory contents
+pub async fn list_handler(
+    axum::extract::Query(params): axum::extract::Query<FileQuery>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    use axum::Json;
+    use axum::http::StatusCode;
+
+    let current_dir = get_current_dir(&state, params.session_id.as_ref()).await;
+
+    // Get target path
+    let target_path = if let Some(ref path) = params.path {
+        if path.is_empty() || path == "." {
+            current_dir.clone()
+        } else {
+            let decoded_path = url_decoding(path);
+            if decoded_path.starts_with('/') {
+                PathBuf::from(&decoded_path)
+            } else {
+                current_dir.join(&decoded_path)
+            }
+        }
+    } else {
+        current_dir.clone()
+    };
+
+    // Check if path exists
+    if !target_path.exists() {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Directory not found"}))).into_response();
+    }
+
+    let mut files = Vec::new();
+
+    if target_path.is_dir() {
+        // List directory contents
+        match fs::read_dir(&target_path) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let metadata = entry.metadata().ok();
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+                    let size = if !is_dir {
+                        metadata.as_ref().map(|m| m.len())
+                    } else {
+                        None
+                    };
+                    let modified = metadata.as_ref().and_then(|m| m.modified().ok()).map(|t| {
+                        t.duration_since(std::time::SystemTime::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs()
+                    });
+
+                    // Skip hidden files
+                    if !name.starts_with('.') {
+                        files.push(FileInfo {
+                            path: entry.path().to_string_lossy().to_string(),
+                            name,
+                            is_dir,
+                            size,
+                            modified,
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response();
+            }
+        }
+    }
+
+    // Sort: directories first, then files
+    files.sort_by(|a, b| {
+        if a.is_dir && !b.is_dir {
+            std::cmp::Ordering::Less
+        } else if !a.is_dir && b.is_dir {
+            std::cmp::Ordering::Greater
+        } else {
+            a.name.cmp(&b.name)
+        }
+    });
+
+    let listing = DirectoryListing {
+        current_path: target_path.to_string_lossy().to_string(),
+        files,
+    };
+
+    Json(listing).into_response()
+}
+
+/// Upload handler - handles file uploads
+pub async fn upload_handler(
+    State(state): State<AppState>,
+    mut multipart: axum::extract::Multipart,
+) -> impl IntoResponse {
+    use axum::http::StatusCode;
+
+    let current_dir = &state.initial_dir;
+
+    // Process all fields until we find a file
+    loop {
+        let field_result: Result<Option<axum::extract::multipart::Field<'_>>, _> = multipart.next_field().await;
+
+        let field = match field_result {
+            Ok(Some(f)) => f,
+            Ok(None) => break, // No more fields
+            Err(_) => continue, // Skip error and try next field
+        };
+
+        // Get filename from the field
+        let filename = match field.file_name() {
+            Some(name) if !name.is_empty() => name.to_string(),
+            _ => continue, // Skip fields without filename
+        };
+
+        // Get file data
+        let data: Vec<u8> = match field.bytes().await {
+            Ok(bytes) => bytes.to_vec(),
+            Err(_) => return (StatusCode::BAD_REQUEST, "Failed to read file data").into_response(),
+        };
+
+        // Build file path
+        let file_path = current_dir.join(&filename);
+
+        // Create parent directories if needed
+        if let Some(parent) = file_path.parent() {
+            if !parent.exists() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    error!("Failed to create directory: {}", e);
+                    return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create directory: {}", e)).into_response();
+                }
+            }
+        }
+
+        // Write file
+        match File::create(&file_path) {
+            Ok(mut file) => {
+                if let Err(e) = file.write_all(&data) {
+                    error!("Failed to write file: {}", e);
+                    return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write file: {}", e)).into_response();
+                }
+                if let Err(e) = file.flush() {
+                    error!("Failed to flush file: {}", e);
+                    return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to flush file: {}", e)).into_response();
+                }
+
+                info!("File uploaded: {} ({} bytes)", file_path.display(), data.len());
+
+                return (StatusCode::OK, format!("File uploaded: {}", file_path.display())).into_response();
+            }
+            Err(e) => {
+                error!("Failed to create file: {}", e);
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create file: {}", e)).into_response();
+            }
+        }
+    }
+
+    (StatusCode::BAD_REQUEST, "No valid file found in upload").into_response()
+}
+

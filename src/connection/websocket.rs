@@ -2,12 +2,13 @@ use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::{interval, Duration};
-use tokio_tungstenite::tungstenite::protocol::Message;
+
+// Axum WebSocket types
+use axum::extract::ws::{Message, WebSocket};
+
 use serde::{Deserialize, Serialize};
-use tokio_tungstenite::WebSocketStream;
 
 use crate::auth::{AuthMethod, Authenticator, Credentials};
 use crate::session::SessionManager;
@@ -28,7 +29,7 @@ struct ResizeMessage {
 /// 2. forward websocket to pty
 /// 3. periodically sync current directory
 pub async fn handle_websocket_connection(
-    ws_stream: WebSocketStream<TcpStream>,
+    socket: WebSocket,
     initial_config_dir: PathBuf,
     session_manager: SessionManager,
     authenticator: Arc<Box<dyn Authenticator>>,
@@ -47,8 +48,8 @@ pub async fn handle_websocket_connection(
             .as_micros()
     );
 
-    // TODO: review为什么sink是sender， stream是receiver
-    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+    // Split WebSocket into sender and receiver
+    let (mut ws_sender, mut ws_receiver) = socket.split();
 
     // Create session-local current directory (not shared with other connections)
     // TODO: review. initial_config_dir.clone is useless?

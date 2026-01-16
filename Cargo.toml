@@ -4,9 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+axum = { version = "0.7", features = ["macros", "ws", "tokio", "http1", "multipart"] }
 tokio = { version = "1.40", features = ["full"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
+tower = "0.5"
+tower-http = { version = "0.5", features = ["cors"] }
+bytes = "1.0"
 pty = "0.2"
 libc = "0.2"
 log = "0.4"
