@@ -88,10 +88,12 @@
         fileList.innerHTML = '<div class="loading-spinner">Loading...</div>';
 
         try {
-            const encodedPath = encodeURIComponent(path);
-            const sessionParam = `&session_id=${encodeURIComponent(sessionId)}`;
-            const tokenParam = `&token=${encodeURIComponent(authToken)}`;
-            const response = await fetch(`/api/ls?path=${encodedPath}${tokenParam}${sessionParam}`);
+            const params = new URLSearchParams({
+                path: path,
+                token: authToken,
+                session_id: sessionId
+            });
+            const response = await fetch(`/api/ls?${params}`);
 
             if (response.ok) {
                 const data = await response.json();
@@ -186,12 +188,14 @@
         const blob = file instanceof Blob ? file : new Blob([file], { type: file.type || 'application/octet-stream' });
         formData.append('file', blob, path);
 
-        const sessionParam = `&session_id=${encodeURIComponent(sessionId)}`;
-        const tokenParam = `?token=${encodeURIComponent(authToken)}`;
+        const params = new URLSearchParams({
+            token: authToken,
+            session_id: sessionId
+        });
 
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
-                const response = await fetch(`/api/upload${tokenParam}${sessionParam}`, {
+                const response = await fetch(`/api/upload?${params}`, {
                     method: 'POST',
                     body: formData
                 });
@@ -245,10 +249,12 @@
         try {
             term.write('\r\n\x1b[33mDownloading: ' + path + (isDir ? ' (as ZIP)' : '') + '\x1b[0m\r\n');
 
-            const encodedPath = encodeURIComponent(path);
-            const tokenParam = `&token=${encodeURIComponent(authToken)}`;
-            const sessionParam = `&session_id=${encodeURIComponent(sessionId)}`;
-            const response = await fetch(`/api/download?path=${encodedPath}${tokenParam}${sessionParam}`);
+            const params = new URLSearchParams({
+                path: path,
+                token: authToken,
+                session_id: sessionId
+            });
+            const response = await fetch(`/api/download?${params}`);
 
             if (response.ok) {
                 const contentDisposition = response.headers.get('Content-Disposition');
