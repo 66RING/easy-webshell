@@ -3,6 +3,8 @@
 //! This module contains all the data structures used for
 //! HTTP request parsing and response serialization.
 
+#![allow(dead_code)]  // Allow unused types - they're defined for future use
+
 use serde::{Deserialize, Serialize};
 
 /// Query parameters for file operations (download, list)

@@ -1,15 +1,15 @@
-use crate::fs_opt::{FileInfo, create_zip_from_directory, DirectoryListing};
-use crate::server::AppState;
 use crate::api::types::FileQuery;
+use crate::fs_opt::{create_zip_from_directory, DirectoryListing, FileInfo};
+use crate::server::AppState;
 use axum::{
-    response::{IntoResponse, Response},
-    extract::State,
     body::Body,
+    extract::State,
+    response::{IntoResponse, Response},
 };
 use log::{error, info};
 use std::fs::{self, File};
 use std::io::Write;
-use std::path::{PathBuf, Path};
+use std::path::PathBuf;
 
 /// HTML content for the terminal interface
 pub fn get_html_content() -> String {
@@ -62,136 +62,11 @@ pub fn url_decoding(input: &str) -> String {
     result
 }
 
-
-/// Handle file upload request
-pub async fn handle_file_upload(
-    content_type: &str,
-    body: &[u8],
-    current_dir: &Path,
-) -> Result<String, Box<dyn std::error::Error>> {
-    // Extract boundary from Content-Type
-    let boundary = content_type
-        .strip_prefix("multipart/form-data; boundary=")
-        .ok_or("Invalid content type")?;
-
-    let (filename, file_data) = parse_multipart_upload(body, boundary)?;
-
-    let file_path = current_dir.join(&filename);
-
-    // Create parent directories if they don't exist
-    if let Some(parent) = file_path.parent() {
-        if !parent.exists() {
-            fs::create_dir_all(parent)?;
-        }
-    }
-
-    // Write file to disk (binary mode)
-    let mut file = File::create(&file_path)?;
-    file.write_all(&file_data)?;
-    file.flush()?;
-
-    info!(
-        "File uploaded: {} ({} bytes)",
-        file_path.display(),
-        file_data.len()
-    );
-
-    Ok(format!("File uploaded: {}", file_path.display()))
-}
-
-/// List files in a directory
-pub async fn handle_list_directory(
-    query: &str,
-    current_dir: &Path,
-) -> Result<DirectoryListing, Box<dyn std::error::Error>> {
-    // Parse query parameter: ?path=/folder or ?path=relative/path or ?path=.&session_id=xxx
-    let path_param = query
-        .strip_prefix("?")
-        .unwrap_or(query)
-        .split('&')
-        .find_map(|p| {
-            let p = p.trim_start_matches("path=");
-            if p.contains('=') {
-                None
-            } else {
-                Some(p)
-            }
-        })
-        .unwrap_or("");
-
-    let target_path = if path_param.is_empty() || path_param == "." {
-        current_dir.to_path_buf()
-    } else {
-        let decoded_path = url_decoding(path_param);
-        if decoded_path.starts_with('/') {
-            PathBuf::from(&decoded_path)
-        } else {
-            current_dir.join(&decoded_path)
-        }
-    };
-
-    if !target_path.exists() {
-        return Err("Directory not found".into());
-    }
-
-    let mut files = Vec::new();
-
-    if target_path.is_dir() {
-        // List directory contents
-        let entries = fs::read_dir(&target_path)?;
-        for entry in entries {
-            let entry = entry?;
-            let metadata = entry.metadata().ok();
-            let name = entry.file_name().to_string_lossy().to_string();
-            let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-            let size = if !is_dir {
-                metadata.as_ref().map(|m| m.len())
-            } else {
-                None
-            };
-            let modified = metadata.as_ref().and_then(|m| m.modified().ok()).map(|t| {
-                t.duration_since(std::time::SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-            });
-
-            // Skip hidden files
-            if !name.starts_with('.') {
-                files.push(FileInfo {
-                    path: entry.path().to_string_lossy().to_string(),
-                    name,
-                    is_dir,
-                    size,
-                    modified,
-                });
-            }
-        }
-    }
-
-    // Sort: directories first, then files
-    files.sort_by(|a, b| {
-        if a.is_dir && !b.is_dir {
-            return std::cmp::Ordering::Less;
-        } else if !a.is_dir && b.is_dir {
-            return std::cmp::Ordering::Greater;
-        }
-        a.name.cmp(&b.name)
-    });
-
-    Ok(DirectoryListing {
-        current_path: target_path.to_string_lossy().to_string(),
-        files,
-    })
-}
-
-/////////////// TODO: review
-
 /// Index handler - serves the HTML page
 pub async fn index_handler() -> impl IntoResponse {
     let html = get_html_content();
     axum::response::Html(html)
 }
-
 
 /// Download handler - serves file downloads
 pub async fn download_handler(
@@ -221,7 +96,11 @@ pub async fn download_handler(
 
     // Check if file exists
     if !file_path.exists() {
-        return (StatusCode::NOT_FOUND, format!("File not found: {}", file_path.display())).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            format!("File not found: {}", file_path.display()),
+        )
+            .into_response();
     }
 
     // Handle directory - create zip
@@ -238,7 +117,10 @@ pub async fn download_handler(
                 let response = Response::builder()
                     .status(200)
                     .header("content-type", "application/zip")
-                    .header("content-disposition", format!("attachment; filename=\"{}\"", filename))
+                    .header(
+                        "content-disposition",
+                        format!("attachment; filename=\"{}\"", filename),
+                    )
                     .header("content-length", zip_data.len())
                     .header("access-control-allow-origin", "*")
                     .body(Body::from(zip_data))
@@ -266,21 +148,26 @@ pub async fn download_handler(
                     .to_string()
             });
 
-            info!("File downloaded: {} ({} bytes)", file_path.display(), file_data.len());
+            info!(
+                "File downloaded: {} ({} bytes)",
+                file_path.display(),
+                file_data.len()
+            );
 
             let response = Response::builder()
                 .status(200)
                 .header("content-type", content_type)
-                .header("content-disposition", format!("attachment; filename=\"{}\"", filename))
+                .header(
+                    "content-disposition",
+                    format!("attachment; filename=\"{}\"", filename),
+                )
                 .header("content-length", file_data.len())
                 .header("access-control-allow-origin", "*")
                 .body(Body::from(file_data))
                 .unwrap();
             response.into_response()
         }
-        Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
@@ -289,8 +176,8 @@ pub async fn list_handler(
     axum::extract::Query(params): axum::extract::Query<FileQuery>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    use axum::Json;
     use axum::http::StatusCode;
+    use axum::Json;
 
     let current_dir = get_current_dir(&state, params.session_id.as_ref()).await;
 
@@ -312,7 +199,11 @@ pub async fn list_handler(
 
     // Check if path exists
     if !target_path.exists() {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Directory not found"}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Directory not found"})),
+        )
+            .into_response();
     }
 
     let mut files = Vec::new();
@@ -349,7 +240,11 @@ pub async fn list_handler(
                 }
             }
             Err(e) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response();
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+                    .into_response();
             }
         }
     }
@@ -384,11 +279,12 @@ pub async fn upload_handler(
 
     // Process all fields until we find a file
     loop {
-        let field_result: Result<Option<axum::extract::multipart::Field<'_>>, _> = multipart.next_field().await;
+        let field_result: Result<Option<axum::extract::multipart::Field<'_>>, _> =
+            multipart.next_field().await;
 
         let field = match field_result {
             Ok(Some(f)) => f,
-            Ok(None) => break, // No more fields
+            Ok(None) => break,  // No more fields
             Err(_) => continue, // Skip error and try next field
         };
 
@@ -412,7 +308,11 @@ pub async fn upload_handler(
             if !parent.exists() {
                 if let Err(e) = fs::create_dir_all(parent) {
                     error!("Failed to create directory: {}", e);
-                    return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create directory: {}", e)).into_response();
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to create directory: {}", e),
+                    )
+                        .into_response();
                 }
             }
         }
@@ -422,24 +322,43 @@ pub async fn upload_handler(
             Ok(mut file) => {
                 if let Err(e) = file.write_all(&data) {
                     error!("Failed to write file: {}", e);
-                    return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write file: {}", e)).into_response();
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to write file: {}", e),
+                    )
+                        .into_response();
                 }
                 if let Err(e) = file.flush() {
                     error!("Failed to flush file: {}", e);
-                    return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to flush file: {}", e)).into_response();
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to flush file: {}", e),
+                    )
+                        .into_response();
                 }
 
-                info!("File uploaded: {} ({} bytes)", file_path.display(), data.len());
+                info!(
+                    "File uploaded: {} ({} bytes)",
+                    file_path.display(),
+                    data.len()
+                );
 
-                return (StatusCode::OK, format!("File uploaded: {}", file_path.display())).into_response();
+                return (
+                    StatusCode::OK,
+                    format!("File uploaded: {}", file_path.display()),
+                )
+                    .into_response();
             }
             Err(e) => {
                 error!("Failed to create file: {}", e);
-                return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create file: {}", e)).into_response();
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to create file: {}", e),
+                )
+                    .into_response();
             }
         }
     }
 
     (StatusCode::BAD_REQUEST, "No valid file found in upload").into_response()
 }
-
