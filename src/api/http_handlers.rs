@@ -11,14 +11,6 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
 
-/// HTML content for the terminal interface
-pub fn get_html_content() -> String {
-    std::fs::read_to_string("index.html").unwrap_or_else(|e| {
-        error!("Failed to read index.html: {}", e);
-        "<html><body><h1>Error loading page</h1></body></html>".to_string()
-    })
-}
-
 /// Helper function to get current directory for a session
 async fn get_current_dir(state: &AppState, session_id: Option<&String>) -> PathBuf {
     if let Some(sid) = session_id {
@@ -64,13 +56,16 @@ pub fn url_decoding(input: &str) -> String {
 
 /// Index handler - serves the HTML page
 pub async fn index_handler() -> impl IntoResponse {
-    let html = get_html_content();
+    let html = std::fs::read_to_string("static/index.html").unwrap_or_else(|e| {
+        error!("Failed to read index.html: {}", e);
+        "<html><body><h1>Error loading page</h1></body></html>".to_string()
+    });
     axum::response::Html(html)
 }
 
 /// CSS handler - serves the stylesheet
 pub async fn css_handler() -> impl IntoResponse {
-    let css = std::fs::read_to_string("style.css").unwrap_or_else(|e| {
+    let css = std::fs::read_to_string("static/style.css").unwrap_or_else(|e| {
         error!("Failed to read style.css: {}", e);
         String::new()
     });
@@ -83,7 +78,7 @@ pub async fn css_handler() -> impl IntoResponse {
 
 /// JavaScript handler - serves the app script
 pub async fn js_handler() -> impl IntoResponse {
-    let js = std::fs::read_to_string("app.js").unwrap_or_else(|e| {
+    let js = std::fs::read_to_string("static/app.js").unwrap_or_else(|e| {
         error!("Failed to read app.js: {}", e);
         String::new()
     });
