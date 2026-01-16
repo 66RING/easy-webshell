@@ -27,7 +27,7 @@ async fn get_current_dir(state: &AppState, session_id: Option<&String>) -> PathB
             return dir.lock().await.clone();
         }
     }
-    state.initial_dir.clone()
+    unreachable!("Each session has at least a init dir.")
 }
 
 /// Simple URL decoding (percent decoding)

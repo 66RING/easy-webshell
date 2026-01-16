@@ -7,6 +7,7 @@
     let wsConnected = false;
     let authenticated = false;
     let sessionId = null;
+    let authToken = null;
     let pendingInput = [];
     let pendingAuth = false;
     let currentBrowserPath = '.';
@@ -60,7 +61,7 @@
     }
 
     function openFileBrowser(path) {
-        if (!authenticated || !sessionId) {
+        if (!authenticated || !authToken) {
             console.warn('Not authenticated');
             return;
         }
@@ -76,7 +77,7 @@
     }
 
     async function loadDirectory(path) {
-        if (!authenticated || !sessionId) {
+        if (!authenticated || !authToken) {
             console.warn('Not authenticated');
             return;
         }
@@ -89,7 +90,8 @@
         try {
             const encodedPath = encodeURIComponent(path);
             const sessionParam = `&session_id=${encodeURIComponent(sessionId)}`;
-            const response = await fetch(`/api/ls?path=${encodedPath}${sessionParam}`);
+            const tokenParam = `&token=${encodeURIComponent(authToken)}`;
+            const response = await fetch(`/api/ls?path=${encodedPath}${tokenParam}${sessionParam}`);
 
             if (response.ok) {
                 const data = await response.json();
@@ -175,7 +177,7 @@
     }
 
     async function uploadFile(file, path, maxRetries = 3) {
-        if (!authenticated || !sessionId) {
+        if (!authenticated || !authToken) {
             console.warn('Not authenticated');
             return false;
         }
@@ -184,11 +186,12 @@
         const blob = file instanceof Blob ? file : new Blob([file], { type: file.type || 'application/octet-stream' });
         formData.append('file', blob, path);
 
-        const sessionParam = `?session_id=${encodeURIComponent(sessionId)}`;
+        const sessionParam = `&session_id=${encodeURIComponent(sessionId)}`;
+        const tokenParam = `?token=${encodeURIComponent(authToken)}`;
 
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
-                const response = await fetch(`/api/upload${sessionParam}`, {
+                const response = await fetch(`/api/upload${tokenParam}${sessionParam}`, {
                     method: 'POST',
                     body: formData
                 });
@@ -234,7 +237,7 @@
     }
 
     async function downloadFile(path, isDir = false) {
-        if (!authenticated || !sessionId) {
+        if (!authenticated || !authToken) {
             console.warn('Not authenticated');
             return;
         }
@@ -243,8 +246,9 @@
             term.write('\r\n\x1b[33mDownloading: ' + path + (isDir ? ' (as ZIP)' : '') + '\x1b[0m\r\n');
 
             const encodedPath = encodeURIComponent(path);
+            const tokenParam = `&token=${encodeURIComponent(authToken)}`;
             const sessionParam = `&session_id=${encodeURIComponent(sessionId)}`;
-            const response = await fetch(`/api/download?path=${encodedPath}${sessionParam}`);
+            const response = await fetch(`/api/download?path=${encodedPath}${tokenParam}${sessionParam}`);
 
             if (response.ok) {
                 const contentDisposition = response.headers.get('Content-Disposition');
@@ -348,6 +352,11 @@
                     if (msg.session_id) {
                         sessionId = msg.session_id;
                         console.log('Session ID (auth success):', sessionId);
+                    }
+
+                    if (msg.token) {
+                        authToken = msg.token;
+                        console.log('Auth token received');
                     }
 
                     const loginBtn = document.querySelector('.btn-login');

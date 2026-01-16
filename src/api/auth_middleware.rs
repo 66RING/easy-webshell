@@ -5,43 +5,52 @@ use axum::{
     response::Response,
     Json,
 };
-use crate::session::is_authenticated;
 use crate::server::AppState;
+use crate::jwt::validate_token;
+use crate::session::is_authenticated;
 use serde_json::json;
+use log::debug;
 
 /// Authentication middleware
-/// Validates session_id from query parameters before allowing request to proceed
+/// Validates JWT token from query parameters before allowing request to proceed
 pub async fn auth_middleware(
     State(state): State<AppState>,
     request: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
-    // Extract session_id from query string
+    // Extract token from query string
     let uri = request.uri();
     let query = uri.query().unwrap_or("");
-    let session_id = query
+    let token = query
         .split('&')
         .find_map(|pair| {
             let mut kv = pair.split('=');
-            if kv.next() == Some("session_id") {
+            if kv.next() == Some("token") {
                 kv.next()
             } else {
                 None
             }
         });
 
-    let sid = session_id.ok_or((
+    let token_str = token.ok_or((
         StatusCode::UNAUTHORIZED,
-        Json(json!({"error": "No session ID provided"})),
+        Json(json!({"error": "No authentication token provided"})),
     ))?;
 
-    // Verify session is authenticated
-    if is_authenticated(&state.authenticated_sessions, sid).await {
+    // Validate JWT token and extract session_id
+    let session_id = validate_token(token_str, &state.jwt_keys)
+        .map_err(|e| {
+            debug!("JWT validation failed: {}", e);
+            (StatusCode::UNAUTHORIZED, Json(json!({"error": format!("Invalid token: {}", e)})))
+        })?;
+
+    // Also verify session is still active (double-check)
+    if is_authenticated(&state.authenticated_sessions, &session_id).await {
         Ok(next.run(request).await)
     } else {
         Err((
             StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "Session not authenticated"})),
+            Json(json!({"error": "Session not active or has expired"})),
         ))
     }
 }

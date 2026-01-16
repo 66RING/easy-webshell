@@ -19,6 +19,7 @@ use crate::auth::create_authenticator;
 use crate::config::Config;
 use crate::connection::websocket::handle_websocket_connection;
 use crate::session::{SessionManager, create_authenticated_sessions, AuthenticatedSessions};
+use crate::jwt::JwtKeys;
 
 /// Application state shared across all handlers
 #[derive(Clone)]
@@ -27,6 +28,7 @@ pub struct AppState {
     pub authenticated_sessions: AuthenticatedSessions,
     pub initial_dir: PathBuf,
     pub authenticator: Arc<Box<dyn crate::auth::Authenticator>>,
+    pub jwt_keys: Arc<JwtKeys>,
 }
 
 /// WebSocket handler using Axum
@@ -42,6 +44,7 @@ async fn websocket_handler(
             state.initial_dir,
             state.sessions,
             state.authenticated_sessions,
+            state.jwt_keys,
             state.authenticator,
         )
         .await
@@ -67,6 +70,11 @@ pub async fn run_server(config: Config) -> Result<(), Box<dyn std::error::Error>
     // Create authenticated sessions tracker
     let authenticated_sessions = create_authenticated_sessions();
 
+    // Generate JWT secret key
+    let jwt_secret = JwtKeys::generate_random();
+    let jwt_keys = Arc::new(JwtKeys::from_secret(&jwt_secret));
+    info!("Generated JWT secret key");
+
     // Determine initial working directory
     let initial_dir = if let Some(ref custom_dir) = config.server.cur_dir {
         PathBuf::from(custom_dir)
@@ -86,6 +94,7 @@ pub async fn run_server(config: Config) -> Result<(), Box<dyn std::error::Error>
         authenticated_sessions: authenticated_sessions.clone(),
         initial_dir: initial_dir.clone(),
         authenticator: authenticator.clone(),
+        jwt_keys: jwt_keys.clone(),
     };
 
     info!("Starting TTYD server on {}:{}", host, port);

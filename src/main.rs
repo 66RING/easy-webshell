@@ -6,6 +6,7 @@ mod auth;
 mod config;
 mod connection;
 mod fs_opt;
+mod jwt;
 mod server;
 mod session;
 mod shell;

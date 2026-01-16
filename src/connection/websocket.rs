@@ -14,6 +14,7 @@ use crate::auth::{AuthMethod, Authenticator, Credentials};
 use crate::session::{SessionManager, add_authenticated_session, remove_authenticated_session, AuthenticatedSessions};
 use crate::shell::PtySession;
 use crate::shell::pty::sync_current_directory;
+use crate::jwt::generate_token;
 
 /// Resize message from client
 #[derive(Debug, Serialize, Deserialize)]
@@ -33,10 +34,9 @@ pub async fn handle_websocket_connection(
     initial_config_dir: PathBuf,
     session_manager: SessionManager,
     authenticated_sessions: AuthenticatedSessions,
+    jwt_keys: Arc<crate::jwt::JwtKeys>,
     authenticator: Arc<Box<dyn Authenticator>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    info!("New WebSocket connection established");
-
     use tokio::sync::mpsc;
 
     // Generate unique session ID
@@ -57,6 +57,8 @@ pub async fn handle_websocket_connection(
     // 为什么需要session dir?
     // session dir从initial_config_dir中初始化 => clone出一个新的
     let session_current_dir = Arc::new(Mutex::new(initial_config_dir.clone()));
+
+    info!("New WebSocket connection established. session id {}, dir {}", session_id, session_current_dir.lock().await.display());
 
     // Register session
     {
@@ -141,6 +143,7 @@ pub async fn handle_websocket_connection(
     let pty_session_for_sync = pty_session_clone.clone();
     let session_id_for_ws = session_id.clone();
     let authenticated_sessions_for_ws = authenticated_sessions.clone();
+    let jwt_keys_for_ws = jwt_keys.clone();
     let ws_to_pty_task = tokio::spawn(async move {
         let mut authenticated = !auth_enabled;
 
@@ -174,8 +177,20 @@ pub async fn handle_websocket_connection(
                                         authenticated = true;
                                         // Add session to authenticated set
                                         add_authenticated_session(&authenticated_sessions_for_ws, session_id_for_ws.clone()).await;
+
+                                        // Generate JWT token (24 hour expiration)
+                                        let token = generate_token(&session_id_for_ws, &jwt_keys_for_ws, 24)
+                                            .unwrap_or_else(|e| {
+                                                log::error!("Failed to generate JWT token: {}", e);
+                                                String::new()
+                                            });
+
                                         let _ = ctrl_tx.send(
-                                            serde_json::json!({"auth": "success", "session_id": session_id_for_ws}).to_string()
+                                            serde_json::json!({
+                                                "auth": "success",
+                                                "session_id": session_id_for_ws,
+                                                "token": token
+                                            }).to_string()
                                         ).await;
                                         info!("Authentication successful for user: {}", username);
                                         continue;
