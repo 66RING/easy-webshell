@@ -3,7 +3,7 @@
 //! This module contains all the data structures used for
 //! HTTP request parsing and response serialization.
 
-#![allow(dead_code)]  // Allow unused types - they're defined for future use
+#![allow(dead_code)] // Allow unused types - they're defined for future use
 
 use serde::{Deserialize, Serialize};
 
@@ -62,4 +62,19 @@ pub struct JsonResponse<T> {
     /// Optional message
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+/// WebSocket message types from client
+/// Uses tagged enum for better extensibility
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+pub enum WsClientMessage {
+    #[serde(rename = "input")]
+    Input { data: String },
+    #[serde(rename = "resize")]
+    Resize { cols: u16, rows: u16 },
+    #[serde(rename = "auth")]
+    Auth { username: String, password: String },
+    #[serde(rename = "ping")]
+    Ping,
 }

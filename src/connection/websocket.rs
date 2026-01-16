@@ -8,21 +8,15 @@ use tokio::time::{interval, Duration};
 // Axum WebSocket types
 use axum::extract::ws::{Message, WebSocket};
 
-use serde::{Deserialize, Serialize};
-
 use crate::auth::{AuthMethod, Authenticator, Credentials};
-use crate::session::{SessionManager, add_authenticated_session, remove_authenticated_session, AuthenticatedSessions};
-use crate::shell::PtySession;
-use crate::shell::pty::sync_current_directory;
 use crate::jwt::generate_token;
+use crate::session::{
+    add_authenticated_session, remove_authenticated_session, AuthenticatedSessions, SessionManager,
+};
+use crate::shell::pty::sync_current_directory;
+use crate::shell::PtySession;
 
-/// Resize message from client
-#[derive(Debug, Serialize, Deserialize)]
-struct ResizeMessage {
-    cols: u16,
-    rows: u16,
-}
-
+use crate::api::types::WsClientMessage;
 
 /// Handle WebSocket connection
 /// 3 worker
@@ -55,7 +49,11 @@ pub async fn handle_websocket_connection(
     // Create session-local current directory (not shared with other connections)
     let session_current_dir = Arc::new(Mutex::new(initial_config_dir.clone()));
 
-    info!("New WebSocket connection established. session id {}, dir {}", session_id, session_current_dir.lock().await.display());
+    info!(
+        "New WebSocket connection established. session id {}, dir {}",
+        session_id,
+        session_current_dir.lock().await.display()
+    );
 
     // Register session
     {
@@ -77,7 +75,6 @@ pub async fn handle_websocket_connection(
     let pty_session_for_sync = pty_session.clone();
 
     // Create channel for control messages (auth responses, etc.)
-    // TODO: review usage
     let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<String>(32);
 
     // Authentication state - shared between tasks
@@ -89,14 +86,10 @@ pub async fn handle_websocket_connection(
     // Task 1: Forward PTY output to WebSocket
     let pty_to_ws_task = tokio::spawn(async move {
         // Send session_id immediately after connection
-        // TODO: 登录后再send?
-        // 这里发送信号给前端: 需要认证还是不需要
         let session_msg = if auth_enabled {
-            serde_json::json!({"auth": "required", "session_id": session_id_for_pty2ws})
-                .to_string()
+            serde_json::json!({"auth": "required", "session_id": session_id_for_pty2ws}).to_string()
         } else {
-            serde_json::json!({"auth": "success", "session_id": session_id_for_pty2ws})
-                .to_string()
+            serde_json::json!({"auth": "success", "session_id": session_id_for_pty2ws}).to_string()
         };
 
         if let Err(e) = ws_sender.send(Message::Text(session_msg)).await {
@@ -107,11 +100,11 @@ pub async fn handle_websocket_connection(
 
         // periodically forward data to frontend
         // 1. forward pty data
-        // 2. TODO: review
         let mut interval = interval(Duration::from_millis(10));
         loop {
             interval.tick().await;
 
+            // forward pty data to frontend
             let mut session = pty_session.lock().await;
             let data = session.read(4096);
             drop(session);
@@ -125,7 +118,7 @@ pub async fn handle_websocket_connection(
             }
 
             // Check for control messages
-            // TODO: review这里接收到的是什么
+            // and forward to frontend
             if let Ok(msg) = ctrl_rx.try_recv() {
                 if ws_sender.send(Message::Text(msg)).await.is_err() {
                     break;
@@ -154,88 +147,107 @@ pub async fn handle_websocket_connection(
         while let Some(result) = ws_receiver.next().await {
             match result {
                 Ok(Message::Text(text)) => {
-                    // Check if it's an authentication message
-                    if !authenticated {
-                        // Try to parse as JSON authentication message
-                        if let Ok(auth_msg) = serde_json::from_str::<serde_json::Value>(&text) {
-                            if auth_msg.get("auth").and_then(|v| v.as_str()) == Some("login") {
-                                if let (Some(username), Some(password)) = (
-                                    auth_msg.get("username").and_then(|v| v.as_str()),
-                                    auth_msg.get("password").and_then(|v| v.as_str()),
-                                ) {
-                                    let credentials = Credentials {
-                                        username: username.to_string(),
-                                        password: Some(password.to_string()),
-                                        ssh_key: None,
-                                    };
+                    // Try to parse as structured message first
+                    if let Ok(msg) = serde_json::from_str::<WsClientMessage>(&text) {
+                        match msg {
+                            // Terminal resize (only when authenticated)
+                            WsClientMessage::Resize { cols, rows } => {
+                                if authenticated {
+                                    debug!("Terminal resized to {}x{}", cols, rows);
+                                    let mut session = pty_session_clone.lock().await;
+                                    let _ = session.set_winsize(cols, rows);
+                                } else {
+                                    debug!("Ignoring resize while not authenticated");
+                                }
+                            }
 
-                                    if authenticator.authenticate(&credentials) {
-                                        authenticated = true;
-                                        // Add session to authenticated set
-                                        add_authenticated_session(&authenticated_sessions_for_ws, session_id_for_ws2pty.clone()).await;
+                            // Text input (only when authenticated)
+                            WsClientMessage::Input { data } => {
+                                if authenticated {
+                                    debug!("WS -> PTY: {} bytes", data.len());
+                                    let mut session = pty_session_clone.lock().await;
+                                    session.write(data.as_bytes());
+                                } else {
+                                    debug!("Ignoring input while not authenticated");
+                                }
+                            }
 
-                                        // Generate JWT token (24 hour expiration)
-                                        let token = generate_token(&session_id_for_ws2pty, &jwt_keys_for_ws, 24)
-                                            .unwrap_or_else(|e| {
-                                                log::error!("Failed to generate JWT token: {}", e);
-                                                String::new()
-                                            });
+                            // Authentication (only when not authenticated)
+                            WsClientMessage::Auth { username, password } => {
+                                if authenticated {
+                                    debug!("Ignoring auth message while already authenticated");
+                                    continue;
+                                }
 
-                                        let _ = ctrl_tx.send(
+                                let credentials = Credentials {
+                                    username,
+                                    password: Some(password),
+                                    ssh_key: None,
+                                };
+
+                                if authenticator.authenticate(&credentials) {
+                                    authenticated = true;
+                                    add_authenticated_session(
+                                        &authenticated_sessions_for_ws,
+                                        session_id_for_ws2pty.clone(),
+                                    )
+                                    .await;
+
+                                    let token = generate_token(
+                                        &session_id_for_ws2pty,
+                                        &jwt_keys_for_ws,
+                                        24,
+                                    )
+                                    .unwrap_or_else(|e| {
+                                        log::error!("Failed to generate JWT token: {}", e);
+                                        String::new()
+                                    });
+
+                                    let _ = ctrl_tx
+                                        .send(
                                             serde_json::json!({
                                                 "auth": "success",
                                                 "session_id": session_id_for_ws2pty,
                                                 "token": token
-                                            }).to_string()
-                                        ).await;
-                                        info!("Authentication successful for user: {}", username);
-                                        continue;
-                                    } else {
-                                        let _ = ctrl_tx
-                                            .send(serde_json::json!({"auth": "failed"}).to_string())
-                                            .await;
-                                        info!("Authentication failed for user: {}", username);
-                                        // Continue to allow retry, don't break the connection
-                                        continue;
-                                    }
+                                            })
+                                            .to_string(),
+                                        )
+                                        .await;
+                                    info!("Authentication successful");
+                                    continue;
+                                } else {
+                                    let _ = ctrl_tx
+                                        .send(serde_json::json!({"auth": "failed"}).to_string())
+                                        .await;
+                                    info!("Authentication failed");
+                                    continue;
                                 }
                             }
-                        }
 
-                        // Not authenticated and not a valid auth message, ignore it
-                        debug!("Ignoring non-auth message while not authenticated");
-                        continue;
-                    }
-
-                    // Check if it's a resize message (JSON)
-                    // TODO: 还有更好的方式处理不同类型的指令吗
-                    // 这里是强制尝试序列化
-                    // 所有指令都通过json格式传递?
-                    if text.starts_with('{') {
-                        // TODO: 如果以后还有resize以为的控制指令, 这里应该怎么设计?
-                        if let Ok(msg) = serde_json::from_str::<ResizeMessage>(&text) {
-                            debug!("Terminal resized to {}x{}", msg.cols, msg.rows);
-                            let mut session = pty_session_clone.lock().await;
-                            let _ = session.set_winsize(msg.cols, msg.rows);
-                        } else {
-                            // Not JSON, treat as regular input
-                            debug!("WS -> PTY: {} bytes", text.len());
-                            let mut session = pty_session_clone.lock().await;
-                            session.write(text.as_bytes());
+                            // Ping/Pong (always allowed)
+                            WsClientMessage::Ping => {
+                                debug!("Received ping from client");
+                            }
                         }
                     } else {
-                        // Regular input to PTY
-                        debug!("WS -> PTY: {} bytes", text.len());
-                        let mut session = pty_session_clone.lock().await;
-                        // TODO: review binary和text都是write
-                        // pty session是有什么协议来识别这里数据类型吗?
-                        session.write(text.as_bytes());
+                        // Legacy: treat plain text as input (for backwards compatibility)
+                        if authenticated {
+                            debug!("WS -> PTY (legacy): {} bytes", text.len());
+                            let mut session = pty_session_clone.lock().await;
+                            session.write(text.as_bytes());
+                        } else {
+                            debug!("Ignoring legacy message while not authenticated");
+                        }
                     }
                 }
                 Ok(Message::Binary(data)) => {
-                    debug!("WS -> PTY: {} bytes (binary)", data.len());
-                    let mut session = pty_session_clone.lock().await;
-                    session.write(&data);
+                    if authenticated {
+                        debug!("WS -> PTY: {} bytes (binary)", data.len());
+                        let mut session = pty_session_clone.lock().await;
+                        session.write(&data);
+                    } else {
+                        debug!("Ignoring binary message while not authenticated");
+                    }
                 }
                 Ok(Message::Close(_)) => {
                     info!("WebSocket close frame received");
@@ -285,7 +297,8 @@ pub async fn handle_websocket_connection(
         sessions.remove(&session_id_for_cleanup);
     }
     // Remove from authenticated sessions
-    remove_authenticated_session(&authenticated_sessions_for_cleanup, &session_id_for_cleanup).await;
+    remove_authenticated_session(&authenticated_sessions_for_cleanup, &session_id_for_cleanup)
+        .await;
     info!(
         "WebSocket connection closed, session {} removed",
         session_id_for_cleanup

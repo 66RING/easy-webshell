@@ -8,7 +8,6 @@
     let authenticated = false;
     let sessionId = null;
     let authToken = null;
-    let pendingInput = [];
     let pendingAuth = false;
     let currentBrowserPath = '.';
     let selectedFile = null;
@@ -28,17 +27,6 @@
         const rows = Math.max(1, Math.floor((height - 8) / cell.height));
         console.log(`Terminal size: ${cols}x${rows}, container: ${width}x${height}`);
         term.resize(cols, rows);
-    }
-
-    function sendToWebSocket(data) {
-        if (wsConnected && authenticated && ws) {
-            ws.send(data);
-            return true;
-        } else if (wsConnected && ws) {
-            pendingInput.push(data);
-            return false;
-        }
-        return false;
     }
 
     function showLoginModal() {
@@ -322,13 +310,6 @@
 
         // Initial fit
         fitTerminal();
-        window.addEventListener('resize', () => {
-            fitTerminal();
-            if (wsConnected && term) {
-                const resize = { cols: term.cols, rows: term.rows };
-                ws.send(JSON.stringify(resize));
-            }
-        });
 
         // Connect to WebSocket
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -373,12 +354,11 @@
                     fitTerminal();
 
                     const resize = { cols: term.cols, rows: term.rows };
-                    ws.send(JSON.stringify(resize));
-
-                    while (pendingInput.length > 0) {
-                        const data = pendingInput.shift();
-                        ws.send(data);
-                    }
+                    ws.send(JSON.stringify({
+                        type: 'resize',
+                        cols: resize.cols,
+                        rows: resize.rows
+                    }));
                     return;
                 } else if (msg.auth === 'failed') {
                     pendingAuth = false;
@@ -423,9 +403,26 @@
             console.error('WebSocket error:', error);
         };
 
-        // Terminal input
+        // Terminal input - send as structured JSON message
         term.onData(data => {
-            sendToWebSocket(data);
+            if (authenticated) {
+                ws.send(JSON.stringify({
+                    type: 'input',
+                    data: data
+                }));
+            }
+        });
+
+        // Handle terminal resize
+        window.addEventListener('resize', () => {
+            fitTerminal();
+            if (wsConnected && authenticated && term) {
+                ws.send(JSON.stringify({
+                    type: 'resize',
+                    cols: term.cols,
+                    rows: term.rows
+                }));
+            }
         });
 
         // Login form
@@ -447,8 +444,9 @@
             pendingAuth = true;
             hideLoginError();
 
+            // Send authentication message with new structured format
             ws.send(JSON.stringify({
-                auth: 'login',
+                type: 'auth',
                 username: username,
                 password: password
             }));
