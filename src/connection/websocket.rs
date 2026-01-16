@@ -53,9 +53,6 @@ pub async fn handle_websocket_connection(
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
     // Create session-local current directory (not shared with other connections)
-    // TODO: review. initial_config_dir.clone is useless?
-    // 为什么需要session dir?
-    // session dir从initial_config_dir中初始化 => clone出一个新的
     let session_current_dir = Arc::new(Mutex::new(initial_config_dir.clone()));
 
     info!("New WebSocket connection established. session id {}, dir {}", session_id, session_current_dir.lock().await.display());
@@ -87,8 +84,7 @@ pub async fn handle_websocket_connection(
     let auth_enabled = !matches!(authenticator.method(), AuthMethod::None);
 
     // Clone session_id for use in first task
-    // TODO: reivew why clone?
-    let session_id_for_first_task = session_id.clone();
+    let session_id_for_pty2ws = session_id.clone();
 
     // Task 1: Forward PTY output to WebSocket
     let pty_to_ws_task = tokio::spawn(async move {
@@ -96,10 +92,10 @@ pub async fn handle_websocket_connection(
         // TODO: 登录后再send?
         // 这里发送信号给前端: 需要认证还是不需要
         let session_msg = if auth_enabled {
-            serde_json::json!({"auth": "required", "session_id": session_id_for_first_task})
+            serde_json::json!({"auth": "required", "session_id": session_id_for_pty2ws})
                 .to_string()
         } else {
-            serde_json::json!({"auth": "success", "session_id": session_id_for_first_task})
+            serde_json::json!({"auth": "success", "session_id": session_id_for_pty2ws})
                 .to_string()
         };
 
@@ -107,7 +103,7 @@ pub async fn handle_websocket_connection(
             error!("Failed to send session_id message: {}", e);
             return;
         }
-        info!("Sent session_id {} to client", session_id_for_first_task);
+        info!("Sent session_id {} to client", session_id_for_pty2ws);
 
         // periodically forward data to frontend
         // 1. forward pty data
@@ -141,7 +137,7 @@ pub async fn handle_websocket_connection(
     // Task 2: Forward WebSocket input to PTY
     // clone a new Arc to do |async move|
     let pty_session_for_sync = pty_session_clone.clone();
-    let session_id_for_ws = session_id.clone();
+    let session_id_for_ws2pty = session_id.clone();
     let authenticated_sessions_for_ws = authenticated_sessions.clone();
     let jwt_keys_for_ws = jwt_keys.clone();
     let ws_to_pty_task = tokio::spawn(async move {
@@ -176,10 +172,10 @@ pub async fn handle_websocket_connection(
                                     if authenticator.authenticate(&credentials) {
                                         authenticated = true;
                                         // Add session to authenticated set
-                                        add_authenticated_session(&authenticated_sessions_for_ws, session_id_for_ws.clone()).await;
+                                        add_authenticated_session(&authenticated_sessions_for_ws, session_id_for_ws2pty.clone()).await;
 
                                         // Generate JWT token (24 hour expiration)
-                                        let token = generate_token(&session_id_for_ws, &jwt_keys_for_ws, 24)
+                                        let token = generate_token(&session_id_for_ws2pty, &jwt_keys_for_ws, 24)
                                             .unwrap_or_else(|e| {
                                                 log::error!("Failed to generate JWT token: {}", e);
                                                 String::new()
@@ -188,7 +184,7 @@ pub async fn handle_websocket_connection(
                                         let _ = ctrl_tx.send(
                                             serde_json::json!({
                                                 "auth": "success",
-                                                "session_id": session_id_for_ws,
+                                                "session_id": session_id_for_ws2pty,
                                                 "token": token
                                             }).to_string()
                                         ).await;
