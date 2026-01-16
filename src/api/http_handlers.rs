@@ -1,5 +1,4 @@
 use crate::api::types::FileQuery;
-use crate::api::AuthenticatedSession;
 use crate::fs_opt::{create_zip_from_directory, DirectoryListing, FileInfo};
 use crate::server::AppState;
 use axum::{
@@ -21,10 +20,12 @@ pub fn get_html_content() -> String {
 }
 
 /// Helper function to get current directory for a session
-async fn get_current_dir(state: &AppState, session_id: &str) -> PathBuf {
-    let sessions = state.sessions.read().await;
-    if let Some(dir) = sessions.get(session_id) {
-        return dir.lock().await.clone();
+async fn get_current_dir(state: &AppState, session_id: Option<&String>) -> PathBuf {
+    if let Some(sid) = session_id {
+        let sessions = state.sessions.read().await;
+        if let Some(dir) = sessions.get(sid) {
+            return dir.lock().await.clone();
+        }
     }
     state.initial_dir.clone()
 }
@@ -97,12 +98,11 @@ pub async fn js_handler() -> impl IntoResponse {
 pub async fn download_handler(
     axum::extract::Query(params): axum::extract::Query<FileQuery>,
     State(state): State<AppState>,
-    AuthenticatedSession(session_id): AuthenticatedSession,
 ) -> impl IntoResponse {
     use axum::http::StatusCode;
 
     // Get current directory based on session
-    let current_dir = get_current_dir(&state, &session_id).await;
+    let current_dir = get_current_dir(&state, params.session_id.as_ref()).await;
 
     // Get path from query parameters
     let path_param = match params.path {
@@ -201,12 +201,11 @@ pub async fn download_handler(
 pub async fn list_handler(
     axum::extract::Query(params): axum::extract::Query<FileQuery>,
     State(state): State<AppState>,
-    AuthenticatedSession(session_id): AuthenticatedSession,
 ) -> impl IntoResponse {
     use axum::http::StatusCode;
     use axum::Json;
 
-    let current_dir = get_current_dir(&state, &session_id).await;
+    let current_dir = get_current_dir(&state, params.session_id.as_ref()).await;
 
     // Get target path
     let target_path = if let Some(ref path) = params.path {
@@ -297,15 +296,14 @@ pub async fn list_handler(
 
 /// Upload handler - handles file uploads
 pub async fn upload_handler(
-    axum::extract::Query(_params): axum::extract::Query<FileQuery>,
+    axum::extract::Query(params): axum::extract::Query<FileQuery>,
     State(state): State<AppState>,
-    AuthenticatedSession(session_id): AuthenticatedSession,
     mut multipart: axum::extract::Multipart,
 ) -> impl IntoResponse {
     use axum::http::StatusCode;
 
     // Get current directory based on session
-    let current_dir = get_current_dir(&state, &session_id).await;
+    let current_dir = get_current_dir(&state, params.session_id.as_ref()).await;
 
     // Process all fields until we find a file
     loop {

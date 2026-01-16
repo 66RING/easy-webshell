@@ -14,7 +14,7 @@ use tokio::sync::RwLock;
 use tower::ServiceBuilder;
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::api::{index_handler, download_handler, list_handler, upload_handler, css_handler, js_handler};
+use crate::api::{index_handler, download_handler, list_handler, upload_handler, css_handler, js_handler, auth_middleware};
 use crate::auth::create_authenticator;
 use crate::config::Config;
 use crate::connection::websocket::handle_websocket_connection;
@@ -102,13 +102,18 @@ pub async fn run_server(config: Config) -> Result<(), Box<dyn std::error::Error>
 
     // Build axum router
     let app = Router::new()
+        // Public routes - no authentication required
         .route("/", get(index_handler))
         .route("/style.css", get(css_handler))
         .route("/app.js", get(js_handler))
-        .route("/download", get(download_handler))
-        .route("/ls", get(list_handler))
-        .route("/upload", post(upload_handler))
         .route("/ws", get(websocket_handler))
+        // Protected routes - authentication required via middleware
+        .nest("/api", Router::new()
+            .route("/download", get(download_handler))
+            .route("/ls", get(list_handler))
+            .route("/upload", post(upload_handler))
+            .layer(axum::middleware::from_fn_with_state(app_state.clone(), auth_middleware))
+        )
         .with_state(app_state)
         .layer(
             ServiceBuilder::new()

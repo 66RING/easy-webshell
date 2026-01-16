@@ -89,7 +89,7 @@
         try {
             const encodedPath = encodeURIComponent(path);
             const sessionParam = `&session_id=${encodeURIComponent(sessionId)}`;
-            const response = await fetch(`/ls?path=${encodedPath}${sessionParam}`);
+            const response = await fetch(`/api/ls?path=${encodedPath}${sessionParam}`);
 
             if (response.ok) {
                 const data = await response.json();
@@ -188,7 +188,7 @@
 
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
-                const response = await fetch(`/upload${sessionParam}`, {
+                const response = await fetch(`/api/upload${sessionParam}`, {
                     method: 'POST',
                     body: formData
                 });
@@ -244,7 +244,7 @@
 
             const encodedPath = encodeURIComponent(path);
             const sessionParam = `&session_id=${encodeURIComponent(sessionId)}`;
-            const response = await fetch(`/download?path=${encodedPath}${sessionParam}`);
+            const response = await fetch(`/api/download?path=${encodedPath}${sessionParam}`);
 
             if (response.ok) {
                 const contentDisposition = response.headers.get('Content-Disposition');
