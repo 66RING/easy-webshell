@@ -1,0 +1,327 @@
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+html, body {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+}
+body {
+    background: #1e1e1e;
+}
+#terminal {
+    width: 100%;
+    height: 100%;
+    padding: 2px;
+}
+/* Prevent xterm from overflowing */
+.xterm-viewport {
+    overflow-y: auto !important;
+    scroll-behavior: auto !important;
+}
+.xterm-screen {
+    max-width: 100%;
+}
+/* Drag and drop overlay */
+#drop-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0, 220, 121, 0.2);
+    border: 4px dashed #0dbc79;
+    display: none;
+    justify-content: center;
+    align-items: center;
+    z-index: 9999;
+    pointer-events: none;
+}
+#drop-overlay.active {
+    display: flex;
+}
+#drop-overlay .message {
+    background: #0dbc79;
+    color: #fff;
+    padding: 20px 40px;
+    border-radius: 8px;
+    font-size: 18px;
+    font-weight: bold;
+}
+/* Download button */
+#download-btn {
+    position: fixed;
+    top: 10px;
+    right: 10px;
+    background: #2472c8;
+    color: #fff;
+    border: none;
+    padding: 10px 20px;
+    border-radius: 5px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: bold;
+    z-index: 1000;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    transition: background 0.2s;
+}
+#download-btn:hover {
+    background: #1e5fa8;
+}
+#download-btn:active {
+    background: #194d8a;
+}
+/* File browser modal */
+#file-browser-modal {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0, 0, 0, 0.7);
+    z-index: 2000;
+    justify-content: center;
+    align-items: center;
+}
+#file-browser-modal.active {
+    display: flex;
+}
+.file-browser-content {
+    background: #252526;
+    border: 1px solid #454545;
+    border-radius: 8px;
+    width: 80%;
+    max-width: 800px;
+    max-height: 80vh;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+}
+.file-browser-header {
+    padding: 20px;
+    border-bottom: 1px solid #454545;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+.file-browser-header h2 {
+    margin: 0;
+    color: #fff;
+    font-size: 18px;
+}
+.browser-hint {
+    color: #888;
+    font-size: 12px;
+    margin-top: 5px;
+}
+.file-browser-close {
+    background: none;
+    border: none;
+    color: #fff;
+    font-size: 24px;
+    cursor: pointer;
+    padding: 0;
+    width: 30px;
+    height: 30px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+}
+.file-browser-close:hover {
+    background: #454545;
+}
+.file-browser-path {
+    padding: 10px 20px;
+    background: #1e1e1e;
+    border-bottom: 1px solid #454545;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+.file-browser-path input {
+    flex: 1;
+    background: #3c3c3c;
+    border: 1px solid #454545;
+    color: #fff;
+    padding: 8px 12px;
+    border-radius: 4px;
+    font-size: 14px;
+    cursor: text;
+}
+.file-browser-path input:focus {
+    outline: none;
+    border-color: #2472c8;
+    background: #454545;
+}
+.file-browser-path input::placeholder {
+    color: #888;
+}
+.file-browser-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 10px;
+}
+.file-item {
+    display: flex;
+    align-items: center;
+    padding: 10px 15px;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background 0.2s;
+    margin-bottom: 2px;
+}
+.file-item:hover {
+    background: #2a2d2e;
+}
+.file-item.directory {
+    color: #0dbc79;
+}
+.file-item.directory .file-item-name::after {
+    content: ' (double-click to enter)';
+    font-size: 11px;
+    color: #666;
+    margin-left: 8px;
+}
+.file-item.file {
+    color: #fff;
+}
+.file-item-icon {
+    margin-right: 10px;
+    font-size: 18px;
+}
+.file-item-name {
+    flex: 1;
+}
+.file-item-size {
+    color: #888;
+    font-size: 12px;
+    margin-left: 10px;
+}
+.file-browser-footer {
+    padding: 15px 20px;
+    border-top: 1px solid #454545;
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+}
+.btn {
+    padding: 8px 16px;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+    transition: background 0.2s;
+}
+.btn-cancel {
+    background: #3c3c3c;
+    color: #fff;
+}
+.btn-cancel:hover {
+    background: #4c4c4c;
+}
+.btn-download {
+    background: #2472c8;
+    color: #fff;
+}
+.btn-download:hover {
+    background: #1e5fa8;
+}
+.loading-spinner {
+    text-align: center;
+    padding: 40px;
+    color: #888;
+}
+/* Login modal styles */
+#login-modal {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0, 0, 0, 0.8);
+    z-index: 3000;
+    justify-content: center;
+    align-items: center;
+}
+#login-modal.active {
+    display: flex;
+}
+.login-content {
+    background: #252526;
+    border: 1px solid #454545;
+    border-radius: 8px;
+    padding: 30px;
+    width: 90%;
+    max-width: 400px;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+}
+.login-content h2 {
+    color: #fff;
+    margin: 0 0 10px 0;
+    font-size: 20px;
+}
+.login-hint {
+    color: #888;
+    font-size: 14px;
+    margin-bottom: 20px;
+}
+.form-group {
+    margin-bottom: 15px;
+}
+.form-group label {
+    display: block;
+    color: #ccc;
+    font-size: 13px;
+    margin-bottom: 5px;
+}
+.form-group input {
+    width: 100%;
+    background: #3c3c3c;
+    border: 1px solid #454545;
+    color: #fff;
+    padding: 10px 12px;
+    border-radius: 4px;
+    font-size: 14px;
+    box-sizing: border-box;
+}
+.form-group input:focus {
+    outline: none;
+    border-color: #2472c8;
+    background: #454545;
+}
+.btn-login {
+    width: 100%;
+    background: #2472c8;
+    color: #fff;
+    border: none;
+    padding: 10px;
+    border-radius: 4px;
+    font-size: 14px;
+    font-weight: bold;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+.btn-login:hover:not(:disabled) {
+    background: #1e5fa8;
+}
+.btn-login:disabled {
+    background: #3c3c3c;
+    color: #888;
+    cursor: not-allowed;
+}
+.form-error {
+    background: #5a1d1d;
+    border: 1px solid #a33;
+    color: #ff9999;
+    padding: 10px;
+    border-radius: 4px;
+    font-size: 13px;
+    margin-bottom: 15px;
+}

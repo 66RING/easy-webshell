@@ -68,6 +68,32 @@ pub async fn index_handler() -> impl IntoResponse {
     axum::response::Html(html)
 }
 
+/// CSS handler - serves the stylesheet
+pub async fn css_handler() -> impl IntoResponse {
+    let css = std::fs::read_to_string("style.css").unwrap_or_else(|e| {
+        error!("Failed to read style.css: {}", e);
+        String::new()
+    });
+    Response::builder()
+        .status(200)
+        .header("content-type", "text/css")
+        .body(Body::from(css))
+        .unwrap()
+}
+
+/// JavaScript handler - serves the app script
+pub async fn js_handler() -> impl IntoResponse {
+    let js = std::fs::read_to_string("app.js").unwrap_or_else(|e| {
+        error!("Failed to read app.js: {}", e);
+        String::new()
+    });
+    Response::builder()
+        .status(200)
+        .header("content-type", "application/javascript")
+        .body(Body::from(js))
+        .unwrap()
+}
+
 /// Download handler - serves file downloads
 pub async fn download_handler(
     axum::extract::Query(params): axum::extract::Query<FileQuery>,
