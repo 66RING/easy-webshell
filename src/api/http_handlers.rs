@@ -14,6 +14,8 @@ use std::path::PathBuf;
 /// Helper function to get current directory for a session
 async fn get_current_dir(state: &AppState, session_id: Option<&String>) -> PathBuf {
     if let Some(sid) = session_id {
+        // TODO: refactor session manager
+        // now is a map[sid] = dir
         let sessions = state.sessions.read().await;
         if let Some(dir) = sessions.get(sid) {
             return dir.lock().await.clone();
@@ -23,6 +25,8 @@ async fn get_current_dir(state: &AppState, session_id: Option<&String>) -> PathB
 }
 
 /// Simple URL decoding (percent decoding)
+/// TODO: review ???
+/// 必须要手动url decoding吗, 有没有库
 pub fn url_decoding(input: &str) -> String {
     let mut result = String::new();
     let mut chars = input.chars();
@@ -109,6 +113,9 @@ pub async fn download_handler(
     let decoded_path = url_decoding(&path_param);
 
     // Build full file path
+    // TODO: review 为什么会存在相对路径和绝对路径的情况
+    // 前端在干嘛?
+    // 直接用一个路径不行?
     let file_path = if decoded_path.starts_with('/') {
         PathBuf::from(&decoded_path)
     } else {
@@ -161,6 +168,10 @@ pub async fn download_handler(
                 .first_or_octet_stream()
                 .to_string();
 
+            // TODO: 看起来param是带dir和filename的?
+            // 什么使用用哪个...
+            // 一个是params.path, 另一个是params.filename
+            // ...
             let filename = params.filename.unwrap_or_else(|| {
                 file_path
                     .file_name()
@@ -201,6 +212,10 @@ pub async fn list_handler(
     use axum::Json;
 
     let current_dir = get_current_dir(&state, params.session_id.as_ref()).await;
+
+    // TODO: review
+    // 1. 当前目录的
+    // 2. 切换过目录的
 
     // Get target path
     let target_path = if let Some(ref path) = params.path {

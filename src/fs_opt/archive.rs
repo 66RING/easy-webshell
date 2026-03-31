@@ -10,6 +10,7 @@ pub fn create_zip_from_directory(dir_path: &Path) -> Result<Vec<u8>, Box<dyn std
     let mut buffer = Vec::new();
     let mut zip = ZipWriter::new(Cursor::new(&mut buffer));
 
+    /// dfs write buffer
     fn add_to_zip(
         zip: &mut ZipWriter<Cursor<&mut Vec<u8>>>,
         dir: &Path,

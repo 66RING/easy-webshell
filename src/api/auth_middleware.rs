@@ -21,11 +21,15 @@ pub async fn auth_middleware(
     // Extract token from query string
     let uri = request.uri();
     let query = uri.query().unwrap_or("");
+    // TODO: split is no a good idea?
+    // way too ugly
     let token = query
         .split('&')
         .find_map(|pair| {
             let mut kv = pair.split('=');
+            // TODO: get k
             if kv.next() == Some("token") {
+                // TODO: return value
                 kv.next()
             } else {
                 None
